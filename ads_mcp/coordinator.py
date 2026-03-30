@@ -19,6 +19,23 @@ server using `@mcp.tool` annotations, thereby 'coordinating' the bootstrapping
 of the server.
 """
 
+import os
+
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Google Ads Server")
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+mcp = FastMCP(
+    "Google Ads Server",
+    host=os.environ.get("HOST", "127.0.0.1"),
+    port=int(os.environ.get("PORT", "8000")),
+    streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
+    json_response=_env_flag("MCP_JSON_RESPONSE", True),
+    stateless_http=_env_flag("MCP_STATELESS_HTTP", True),
+)
