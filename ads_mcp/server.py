@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Entry points for the MCP server."""
-
-import os
-
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+"""Entry point for the MCP server."""
 
 from ads_mcp.coordinator import mcp
 
@@ -33,29 +28,8 @@ from ads_mcp.resources import (
     segments,
 )  # noqa: F401
 
-
-@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
-async def health_check(_: Request) -> JSONResponse:
-    return JSONResponse(
-        {
-            "status": "ok",
-            "transport": "streamable-http",
-            "mcp_path": mcp.settings.streamable_http_path,
-        }
-    )
-
-
 def run_server() -> None:
     mcp.run()
-
-
-def run_cloud_run_server() -> None:
-    mcp.settings.host = os.environ.get("HOST", "0.0.0.0")
-    mcp.settings.port = int(os.environ.get("PORT", "8080"))
-    mcp.settings.streamable_http_path = os.environ.get("MCP_PATH", "/mcp")
-    mcp.settings.json_response = True
-    mcp.settings.stateless_http = True
-    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
