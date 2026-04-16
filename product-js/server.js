@@ -45,6 +45,22 @@ app.get("/api/mcp/tools", async (req, res) => {
   }
 });
 
+// Free testing path (no Gemini required): call MCP tools directly.
+// Body: { "name": "search", "arguments": { ... } }
+app.post("/api/mcp/call", async (req, res) => {
+  try {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const args = typeof req.body?.arguments === "object" && req.body.arguments ? req.body.arguments : {};
+    if (!name) return res.status(400).json({ error: "name is required" });
+
+    const mcp = await getMcpClient();
+    const out = await mcp.callTool({ name, arguments: args });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e?.message ?? String(e) });
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
   try {
     const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
