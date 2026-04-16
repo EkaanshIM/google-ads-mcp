@@ -1,13 +1,19 @@
-# JS Demo UI (No Docker Needed)
+# Google Ads MCP Demo (No Docker)
 
 This is a lightweight browser UI + API written in Node.js for internal demos.
 
-It calls the Google Ads API directly (using your OAuth + refresh token), so it
-does **not** need an MCP client implementation and does **not** require Docker.
+It uses:
+
+- Gemini API (function calling)
+- The official Google Ads MCP server (stdio)
+
+So you can type natural-language questions and have the backend call MCP tools
+to query Google Ads.
 
 ## Prereqs
 
 - Node.js 18+ (recommended: 20+)
+- Python 3.10+ (needed to run the MCP server)
 
 ## Setup
 
@@ -21,6 +27,12 @@ cp .env.example .env
 
 Fill `.env` with your values (same keys you already use on the server).
 
+Install Python deps for the MCP server (from repo root):
+
+```bash
+python -m pip install -e .
+```
+
 ## Run
 
 ```bash
@@ -33,4 +45,5 @@ Open:
 
 ## Notes
 
-- Change history uses `change_event` which only supports the last 30 days.
+- If you prefer running the MCP server via `pipx`, set `MCP_SERVER_COMMAND` and
+  `MCP_SERVER_ARGS` in `.env`.

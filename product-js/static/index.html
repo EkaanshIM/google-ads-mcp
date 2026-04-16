@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Google Ads Demo UI (JS)</title>
+    <title>Google Ads MCP Demo</title>
     <style>
       :root { color-scheme: light; }
       body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
       .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
       label { display:block; font-size: 12px; color:#444; margin-bottom: 6px; }
-      input, select, button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; }
+      input, textarea, button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; }
+      textarea { width: min(900px, 100%); min-height: 96px; resize: vertical; }
       button { cursor: pointer; background: #0b57d0; color: #fff; border: 0; }
-      button.secondary { background: #efefef; color:#111; border: 1px solid #ddd; }
       pre { background:#0b1220; color:#d8e3ff; padding: 14px; border-radius: 14px; overflow:auto; }
       .card { border: 1px solid #eee; border-radius: 16px; padding: 14px; }
       h1 { font-size: 18px; margin: 0 0 12px; }
@@ -19,26 +19,20 @@
     </style>
   </head>
   <body>
-    <h1>Google Ads Demo UI (Node.js)</h1>
-    <p class="muted">Internal demo UI: campaigns, performance, and change history.</p>
+    <h1>Google Ads MCP Demo</h1>
+    <p class="muted">Type a question. The backend uses Gemini function calling + the official Google Ads MCP tools.</p>
 
     <div class="card">
-      <div class="row">
-        <div>
-          <label>Customer ID</label>
-          <input id="customerId" placeholder="6475421500" />
+      <div class="row" style="align-items:start;">
+        <div style="flex: 1; min-width: 260px;">
+          <label>Customer ID (optional)</label>
+          <input id="customerId" placeholder="6475421500" style="width:min(420px, 100%);" />
+          <div style="height: 10px;"></div>
+          <label>Message</label>
+          <textarea id="message" placeholder="Example: List my campaigns with name and status (limit 20)."></textarea>
+          <div style="height: 10px;"></div>
+          <button onclick="send()">Send</button>
         </div>
-        <div>
-          <label>Days</label>
-          <select id="days">
-            <option value="7">Last 7 days</option>
-            <option value="14" selected>Last 14 days</option>
-            <option value="30">Last 30 days</option>
-          </select>
-        </div>
-        <button onclick="run('campaigns')" class="secondary">List Campaigns</button>
-        <button onclick="run('performance')" class="secondary">Performance</button>
-        <button onclick="run('changes')" class="secondary">Change History</button>
       </div>
     </div>
 
@@ -46,22 +40,25 @@
     <pre id="out">Ready.</pre>
 
     <script>
-      async function run(kind) {
+      async function send() {
         const out = document.getElementById('out');
         out.textContent = 'Loading...';
 
         const customerId = document.getElementById('customerId').value.trim();
-        const days = document.getElementById('days').value;
-
-        let url = '';
-        if (kind === 'campaigns') url = '/api/campaigns?customer_id=' + encodeURIComponent(customerId);
-        if (kind === 'performance') url = '/api/performance?customer_id=' + encodeURIComponent(customerId) + '&days=' + encodeURIComponent(days);
-        if (kind === 'changes') url = '/api/change_history?customer_id=' + encodeURIComponent(customerId) + '&days=' + encodeURIComponent(days) + '&limit=50';
+        const message = document.getElementById('message').value.trim();
+        if (!message) {
+          out.textContent = 'Message is required.';
+          return;
+        }
 
         try {
-          const res = await fetch(url);
-          const text = await res.text();
-          out.textContent = text;
+          const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message, customerId })
+          });
+          const json = await res.json().catch(async () => ({ raw: await res.text() }));
+          out.textContent = JSON.stringify(json, null, 2);
         } catch (e) {
           out.textContent = String(e);
         }

@@ -4,6 +4,9 @@
 .python-version
 .gemini
 .vscode
+.env
+.env.*
+!.env.example
 
 # Distribution / packaging
 .Python
