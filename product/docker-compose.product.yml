@@ -1,8 +1,8 @@
 services:
   ads-mcp:
-    build: .
+    build: ..
     command: google-ads-mcp-cloud-run
-    env_file: .env
+    env_file: ../.env
     environment:
       HOST: "0.0.0.0"
       PORT: "8080"
@@ -13,8 +13,8 @@ services:
 
   demo-ui:
     build:
-      context: ./product/app
-    env_file: .env
+      context: ./app
+    env_file: ../.env
     environment:
       # The UI/API reads the same Google Ads env vars as the MCP server.
       PORT: "3000"
