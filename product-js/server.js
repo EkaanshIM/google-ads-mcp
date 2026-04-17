@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url";
 import { runGeminiWithMcp } from "./geminiAgent.js";
 import { getMcpClient } from "./mcp.js";
 
-dotenv.config();
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Important: when running under pm2, cwd can differ. Always load the env file
+// located next to this server entrypoint.
+dotenv.config({ path: path.join(__dirname, ".env") });
 
 function basicAuthMiddleware(req, res, next) {
   const user = process.env.BASIC_AUTH_USER || "";
