@@ -7,6 +7,43 @@ function requireEnv(name) {
   return v;
 }
 
+function usingVertexAi() {
+  const v = String(process.env.GOOGLE_GENAI_USE_VERTEXAI || "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+function vertexProjectId() {
+  return (
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GOOGLE_PROJECT_ID ||
+    process.env.GCLOUD_PROJECT ||
+    ""
+  );
+}
+
+function vertexLocation() {
+  return process.env.GOOGLE_CLOUD_LOCATION || process.env.GOOGLE_CLOUD_REGION || "global";
+}
+
+function createGenAiClient() {
+  if (usingVertexAi()) {
+    const project = vertexProjectId();
+    if (!project) {
+      throw new Error(
+        "Vertex AI mode enabled but project id missing. Set GOOGLE_CLOUD_PROJECT (recommended) or GOOGLE_PROJECT_ID."
+      );
+    }
+    // Auth is done via ADC (service account or gcloud ADC), not via GEMINI_API_KEY.
+    return new GoogleGenAI({
+      vertexai: true,
+      project,
+      location: vertexLocation()
+    });
+  }
+
+  return new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") });
+}
+
 function modelName() {
   return process.env.GEMINI_MODEL || "gemini-2.0-flash";
 }
@@ -53,7 +90,7 @@ function extractFunctionCalls(genaiResponse) {
 }
 
 export async function runGeminiWithMcp({ message, customerId }) {
-  const ai = new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") });
+  const ai = createGenAiClient();
 
   const mcpClient = await getMcpClient();
   const listed = await mcpClient.listTools();

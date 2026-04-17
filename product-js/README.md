@@ -10,6 +10,9 @@ It uses:
 So you can type natural-language questions and have the backend call MCP tools
 to query Google Ads.
 
+If Gemini API key quota is blocked, you can switch to **Vertex AI** auth (ADC)
+instead. See `.env.example`.
+
 ## Prereqs
 
 - Node.js 18+ (recommended: 20+)
@@ -47,3 +50,4 @@ Open:
 
 - If you prefer running the MCP server via `pipx`, set `MCP_SERVER_COMMAND` and
   `MCP_SERVER_ARGS` in `.env`.
+- For Vertex AI, set `GOOGLE_GENAI_USE_VERTEXAI=true` and configure ADC.
