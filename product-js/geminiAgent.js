@@ -52,7 +52,7 @@ function defaultCustomerId() {
   return (
     process.env.DEFAULT_CUSTOMER_ID ||
     process.env.GOOGLE_ADS_DEFAULT_CUSTOMER_ID ||
-    ""
+    "6475421500"
   );
 }
 
@@ -71,25 +71,20 @@ export async function runGeminiWithMcp({ message, customerId }) {
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
+  const effectiveCustomerId = customerId || defaultCustomerId();
+  const customerInstruction = effectiveCustomerId
+    ? `Default customer id context: ${effectiveCustomerId}. Use it for any tool call that requires customer_id unless the user explicitly asks for a different account. `
+    : "";
   const systemPrefix =
     "You are a helpful Google Ads assistant. Use the provided tools to answer. " +
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
-    "When calling any tool that requires customer_id, always set it to the provided customer id context. " +
+    customerInstruction +
     `Current timestamp (UTC): ${nowIso}. ` +
     "If the user asks for the last 24 hours, use a finite GAQL range like DURING LAST_1_DAYS. " +
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
-
-  const effectiveCustomerId = customerId || defaultCustomerId();
-  // Per request: always append the explicit clause "where customer id is ...".
-  const customerClause = effectiveCustomerId
-    ? `\n\nContext: where customer id is ${effectiveCustomerId}.`
-    : "";
-
-  const userText = effectiveCustomerId
-    ? `Customer ID: ${effectiveCustomerId}\n\n${message}${customerClause}`
-    : `${message}${customerClause}`;
+  const userText = message;
 
   const prompt = `${systemPrefix}\n\nUser request:\n${userText}`;
 

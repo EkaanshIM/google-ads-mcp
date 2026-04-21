@@ -16,22 +16,24 @@
       .card { border: 1px solid #eee; border-radius: 16px; padding: 14px; }
       h1 { font-size: 18px; margin: 0 0 12px; }
       .muted { color:#666; font-size: 12px; }
+      .status { margin-top: 10px; font-size: 12px; color:#555; }
     </style>
   </head>
   <body>
     <h1>Google Ads MCP Demo</h1>
-    <p class="muted">Type a question. The backend uses Gemini function calling + the official Google Ads MCP tools.</p>
+    <p class="muted">Type a question. The backend creates an async job, stores the response document, and the page polls until the result is ready.</p>
 
     <div class="card">
       <div class="row" style="align-items:start;">
         <div style="flex: 1; min-width: 260px;">
-          <label>Customer ID (optional)</label>
+          <label>Customer ID (optional default context)</label>
           <input id="customerId" placeholder="6475421500" style="width:min(420px, 100%);" />
           <div style="height: 10px;"></div>
           <label>Message</label>
           <textarea id="message" placeholder="Example: List my campaigns with name and status (limit 20)."></textarea>
           <div style="height: 10px;"></div>
           <button onclick="send()">Send</button>
+          <div id="status" class="status">Idle.</div>
         </div>
       </div>
     </div>
@@ -40,29 +42,114 @@
     <pre id="out">Ready.</pre>
 
     <script>
+      let activePoll = null;
+      const CUSTOMER_ID_KEY = 'googleAdsDemo.customerId';
+      const FALLBACK_CUSTOMER_ID = '6475421500';
+
+      function setStatus(text) {
+        document.getElementById('status').textContent = text;
+      }
+
+      function getStoredCustomerId() {
+        try {
+          return localStorage.getItem(CUSTOMER_ID_KEY) || '';
+        } catch {
+          return '';
+        }
+      }
+
+      function storeCustomerId(value) {
+        try {
+          if (value) {
+            localStorage.setItem(CUSTOMER_ID_KEY, value);
+          } else {
+            localStorage.removeItem(CUSTOMER_ID_KEY);
+          }
+        } catch {
+          // Ignore storage failures and continue without persistence.
+        }
+      }
+
+      function effectiveCustomerId() {
+        const typed = document.getElementById('customerId').value.trim();
+        return typed || getStoredCustomerId() || FALLBACK_CUSTOMER_ID;
+      }
+
+      async function fetchJson(url, options) {
+        const res = await fetch(url, options);
+        const json = await res.json().catch(async () => ({ raw: await res.text() }));
+        if (!res.ok) {
+          throw new Error(json?.error || json?.raw || `Request failed with status ${res.status}`);
+        }
+        return json;
+      }
+
+      function stopPolling() {
+        if (activePoll) {
+          clearTimeout(activePoll);
+          activePoll = null;
+        }
+      }
+
+      async function pollJob(jobId) {
+        const out = document.getElementById('out');
+        try {
+          const job = await fetchJson(`/api/chat/${jobId}`);
+          const status = job?.status || 'unknown';
+          setStatus(`Job ${jobId}: ${status}`);
+          out.textContent = JSON.stringify(job, null, 2);
+
+          if (status === 'completed' || status === 'failed') {
+            stopPolling();
+            return;
+          }
+
+          activePoll = setTimeout(() => pollJob(jobId), 1500);
+        } catch (e) {
+          stopPolling();
+          setStatus('Polling failed.');
+          out.textContent = String(e);
+        }
+      }
+
       async function send() {
         const out = document.getElementById('out');
-        out.textContent = 'Loading...';
+        stopPolling();
+        out.textContent = 'Submitting job...';
+        setStatus('Creating async job...');
 
-        const customerId = document.getElementById('customerId').value.trim();
+        const customerId = effectiveCustomerId();
         const message = document.getElementById('message').value.trim();
         if (!message) {
           out.textContent = 'Message is required.';
+          setStatus('Idle.');
           return;
         }
 
+        storeCustomerId(customerId);
+        document.getElementById('customerId').value = customerId;
+
         try {
-          const res = await fetch('/api/chat', {
+          const job = await fetchJson('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message, customerId })
           });
-          const json = await res.json().catch(async () => ({ raw: await res.text() }));
-          out.textContent = JSON.stringify(json, null, 2);
+          out.textContent = JSON.stringify(job, null, 2);
+          setStatus(`Job ${job.jobId}: ${job.status}`);
+          await pollJob(job.jobId);
         } catch (e) {
+          stopPolling();
+          setStatus('Request failed.');
           out.textContent = String(e);
         }
       }
+
+      (function initCustomerId() {
+        const initial = getStoredCustomerId() || FALLBACK_CUSTOMER_ID;
+        document.getElementById('customerId').value = initial;
+        setStatus(`Using default customer id ${initial}.`);
+      })();
     </script>
   </body>
 </html>
