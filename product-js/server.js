@@ -14,6 +14,8 @@ const __dirname = path.dirname(__filename);
 // located next to this server entrypoint.
 dotenv.config({ path: path.join(__dirname, ".env") });
 const chatJobsDir = path.join(__dirname, "data", "chat-jobs");
+const INLINE_RESPONSE_TIMEOUT_MS = 10_000;
+const activeJobPromises = new Map();
 
 function basicAuthMiddleware(req, res, next) {
   const user = process.env.BASIC_AUTH_USER || "";
@@ -41,6 +43,9 @@ app.get("/api/healthz", (req, res) => res.json({ status: "ok" }));
 app.get("/api/chat/:jobId", async (req, res) => {
   try {
     const job = await readJob(req.params.jobId);
+    if (job.status === "completed" || job.status === "failed") {
+      return res.json(serializeChatResponse(job));
+    }
     res.json(job);
   } catch (e) {
     if (e?.code === "ENOENT") return res.status(404).json({ error: "job not found" });
@@ -92,9 +97,17 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     await writeJob(job);
-    queueChatJob(job).catch((e) => {
+    const jobPromise = queueChatJob(job).catch((e) => {
       console.error(`Job ${jobId} failed`, e);
     });
+    activeJobPromises.set(jobId, jobPromise);
+
+    const inlineJob = await waitForJobCompletion(jobId, INLINE_RESPONSE_TIMEOUT_MS);
+    if (inlineJob && (inlineJob.status === "completed" || inlineJob.status === "failed")) {
+      activeJobPromises.delete(jobId);
+      return res.json(serializeChatResponse(inlineJob));
+    }
+
     res.status(202).json({
       jobId,
       status: job.status,
@@ -245,6 +258,47 @@ async function queueChatJob(job) {
       completedAt: new Date().toISOString(),
       error: e?.message ?? String(e)
     });
+  } finally {
+    activeJobPromises.delete(job.id);
+  }
+}
+
+function serializeChatResponse(job) {
+  if (job.status === "completed") {
+    return {
+      status: "completed",
+      text: job.result?.text || "",
+      result: job.result || null,
+      customerIdUsed: job.result?.customerIdUsed || null,
+      mode: job.result?.mode || null,
+      jobId: job.id
+    };
+  }
+
+  if (job.status === "failed") {
+    return {
+      status: "failed",
+      error: job.error || "Unknown error",
+      jobId: job.id
+    };
+  }
+
+  return job;
+}
+
+async function waitForJobCompletion(jobId, timeoutMs) {
+  const jobPromise = activeJobPromises.get(jobId);
+  if (!jobPromise) return null;
+
+  await Promise.race([
+    jobPromise,
+    new Promise((resolve) => setTimeout(resolve, timeoutMs))
+  ]);
+
+  try {
+    return await readJob(jobId);
+  } catch {
+    return null;
   }
 }
 

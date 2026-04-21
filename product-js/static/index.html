@@ -97,7 +97,13 @@
           const job = await fetchJson(`/api/chat/${jobId}`);
           const status = job?.status || 'unknown';
           setStatus(`Job ${jobId}: ${status}`);
-          out.textContent = JSON.stringify(job, null, 2);
+          if (status === 'completed') {
+            out.textContent = job?.result?.text || job?.text || JSON.stringify(job, null, 2);
+          } else if (status === 'failed') {
+            out.textContent = job?.error || JSON.stringify(job, null, 2);
+          } else {
+            out.textContent = JSON.stringify(job, null, 2);
+          }
 
           if (status === 'completed' || status === 'failed') {
             stopPolling();
@@ -130,14 +136,26 @@
         document.getElementById('customerId').value = customerId;
 
         try {
-          const job = await fetchJson('/api/chat', {
+          const response = await fetchJson('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message, customerId })
           });
-          out.textContent = JSON.stringify(job, null, 2);
-          setStatus(`Job ${job.jobId}: ${job.status}`);
-          await pollJob(job.jobId);
+          if (response?.status === 'completed') {
+            out.textContent = response?.text || response?.result?.text || JSON.stringify(response, null, 2);
+            setStatus('Completed without polling.');
+            return;
+          }
+
+          if (response?.status === 'failed') {
+            out.textContent = response?.error || JSON.stringify(response, null, 2);
+            setStatus('Request failed.');
+            return;
+          }
+
+          out.textContent = JSON.stringify(response, null, 2);
+          setStatus(`Job ${response.jobId}: ${response.status}`);
+          await pollJob(response.jobId);
         } catch (e) {
           stopPolling();
           setStatus('Request failed.');
