@@ -73,7 +73,7 @@ export async function runGeminiWithMcp({ message, customerId }) {
   const nowIso = new Date().toISOString();
   const effectiveCustomerId = customerId || defaultCustomerId();
   const customerInstruction = effectiveCustomerId
-    ? `Default customer id context: ${effectiveCustomerId}. Use it for any tool call that requires customer_id unless the user explicitly asks for a different account. `
+    ? `Backend-provided Google Ads customer_id: ${effectiveCustomerId}. Never ask the user for a customer ID when this value is present. Use this exact value for any tool call that requires customer_id unless the user explicitly asks for a different account. `
     : "";
   const systemPrefix =
     "You are a helpful Google Ads assistant. Use the provided tools to answer. " +
@@ -84,9 +84,11 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
-  const userText = message;
+  const userText = effectiveCustomerId
+    ? `Customer ID: ${effectiveCustomerId}\n\nUser request:\n${message}`
+    : message;
 
-  const prompt = `${systemPrefix}\n\nUser request:\n${userText}`;
+  const prompt = `${systemPrefix}\n\n${userText}`;
 
   // Use the SDK's experimental built-in MCP adapter. This lets the SDK handle
   // function calling + tool execution automatically.

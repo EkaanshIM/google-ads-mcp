@@ -82,7 +82,8 @@ app.post("/api/mcp/call", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
-  const customerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
+  const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
+  const customerId = resolvedCustomerId(requestedCustomerId);
   if (!message) return res.status(400).json({ error: "message is required" });
 
   const jobId = crypto.randomUUID();
