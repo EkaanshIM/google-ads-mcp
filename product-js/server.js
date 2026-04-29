@@ -158,6 +158,28 @@ function isPausedLast24HoursQuestion(message) {
   );
 }
 
+function isProductCountQuestion(message) {
+  const normalized = message.toLowerCase();
+  const mentionsProducts =
+    normalized.includes("product") ||
+    normalized.includes("products") ||
+    normalized.includes("prod count") ||
+    normalized.includes("feed");
+  const asksForCount =
+    normalized.includes("count") ||
+    normalized.includes("how many") ||
+    normalized.includes("total number") ||
+    normalized.includes("total prod");
+  const isTimeScoped =
+    normalized.includes("last 24") ||
+    normalized.includes("24 hour") ||
+    normalized.includes("last 1 day") ||
+    normalized.includes("today") ||
+    normalized.includes("yesterday");
+
+  return mentionsProducts && asksForCount && !isTimeScoped;
+}
+
 async function runPausedCampaignFastPath(customerId) {
   const cid = resolvedCustomerId(customerId);
   if (!cid) {
@@ -227,9 +249,40 @@ async function runPausedCampaignFastPath(customerId) {
   return { text: lines.join("\n"), customerIdUsed: cid, mode: "fast-path" };
 }
 
+async function runProductCountFastPath(customerId) {
+  const cid = resolvedCustomerId(customerId);
+  if (!cid) {
+    throw new Error("A customer id is required for this product count query. Pass customerId or set DEFAULT_CUSTOMER_ID.");
+  }
+
+  const mcp = await getMcpClient();
+  const toolOut = await mcp.callTool({
+    name: "count_rows",
+    arguments: {
+      customer_id: cid,
+      resource: "shopping_product",
+      select_field: "shopping_product.item_id"
+    }
+  });
+
+  const rows = Array.isArray(toolOut?.content) ? toolOut.content : toolOut;
+  const payload = Array.isArray(rows) ? rows[0] ?? {} : rows ?? {};
+  const count = Number(payload?.count ?? 0);
+
+  return {
+    text: `The total product count in your feed is ${count.toLocaleString("en-US")}.`,
+    customerIdUsed: cid,
+    mode: "fast-path"
+  };
+}
+
 async function runChatJob(job) {
   if (isPausedLast24HoursQuestion(job.message)) {
     return runPausedCampaignFastPath(job.customerId);
+  }
+
+  if (isProductCountQuestion(job.message)) {
+    return runProductCountFastPath(job.customerId);
   }
 
   const out = await runGeminiWithMcp({

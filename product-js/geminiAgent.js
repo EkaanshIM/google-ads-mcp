@@ -48,6 +48,32 @@ function modelName() {
   return process.env.GEMINI_MODEL || "gemini-2.0-flash";
 }
 
+function intEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function floatEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function maxOutputTokens() {
+  return intEnv("GEMINI_MAX_OUTPUT_TOKENS", 1024);
+}
+
+function maxToolSteps() {
+  return intEnv("GEMINI_MAX_TOOL_STEPS", 8);
+}
+
+function temperature() {
+  return floatEnv("GEMINI_TEMPERATURE", 0.2);
+}
+
 function defaultCustomerId() {
   return (
     process.env.DEFAULT_CUSTOMER_ID ||
@@ -80,23 +106,31 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
     customerInstruction +
     `Current timestamp (UTC): ${nowIso}. ` +
+    "For count, total, how-many, or aggregate questions, prefer compact tools or minimal queries and never return large row dumps unless the user explicitly asks for rows. " +
     "If the user asks for the last 24 hours, use a finite GAQL range like DURING LAST_1_DAYS. " +
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
   const userText = message;
 
-  const prompt = `${systemPrefix}\n\nUser request:\n${userText}`;
-
   // Use the SDK's experimental built-in MCP adapter. This lets the SDK handle
   // function calling + tool execution automatically.
   const mcpClient = await getMcpClient();
   const tools = [mcpToTool(mcpClient)];
+  const config = {
+    tools,
+    maxOutputTokens: maxOutputTokens(),
+    temperature: temperature(),
+    automaticFunctionCalling: {
+      maximumRemoteCalls: maxToolSteps()
+    }
+  };
 
   const res1 = await ai.models.generateContent({
     model: modelName(),
-    contents: prompt,
-    config: { tools }
+    contents: userText,
+    config,
+    systemInstruction: systemPrefix
   });
 
   let text = extractText(res1);
@@ -105,9 +139,10 @@ export async function runGeminiWithMcp({ message, customerId }) {
     const res2 = await ai.models.generateContent({
       model: modelName(),
       contents:
-        prompt +
+        userText +
         "\n\nIMPORTANT: Provide a final plain-English answer summarizing the tool results. Do not return empty output.",
-      config: { tools }
+      config,
+      systemInstruction: systemPrefix
     });
     text = extractText(res2);
   }

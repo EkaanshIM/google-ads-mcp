@@ -70,6 +70,52 @@ def search(
     return final_output
 
 
+def count_rows(
+    customer_id: str,
+    resource: str,
+    select_field: str,
+    conditions: List[str] = None,
+) -> Dict[str, Any]:
+    """Counts rows from the Google Ads API without returning the full result set.
+
+    Args:
+        customer_id: The id of the customer.
+        resource: The GAQL resource to query.
+        select_field: A valid field from the resource used to stream rows.
+        conditions: List of conditions to filter the data, combined using AND clauses.
+
+    Returns:
+        A dictionary containing the total row count and query details.
+    """
+
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+
+    query_parts = [f"SELECT {select_field} FROM {resource}"]
+
+    if conditions:
+        query_parts.append(f" WHERE {' AND '.join(conditions)}")
+
+    query_parts.append(" PARAMETERS omit_unselected_resource_names=true")
+
+    query = "".join(query_parts)
+    utils.logger.info(f"ads_mcp.count_rows query {query}")
+
+    query_result = ga_service.search_stream(
+        customer_id=customer_id, query=query
+    )
+
+    total_count = 0
+    for batch in query_result:
+        total_count += len(batch.results)
+
+    return {
+        "count": total_count,
+        "resource": resource,
+        "select_field": select_field,
+        "conditions": conditions or [],
+    }
+
+
 def _search_tool_description() -> str:
     """Returns the description for the `search` tool."""
     # Add a warning that will be part of the description
@@ -126,4 +172,21 @@ mcp.add_tool(
     search,
     title="Fetches data from the Google Ads API using the search method",
     description=_search_tool_description(),
+)
+
+mcp.add_tool(
+    count_rows,
+    title="Counts matching Google Ads API rows without returning the full result set",
+    description="""
+Counts matching rows by streaming the query server-side and returning only the total.
+
+Use this when the user asks for totals, counts, or aggregate row volumes and does not
+need the individual rows. This is more token-efficient than the `search` tool because
+it avoids returning the full result set.
+
+### Hints
+    `select_field` must be a valid selectable field on the resource.
+    Keep `conditions` finite and narrowly scoped.
+    Prefer this tool over `search` for "how many", "count", or "total number" queries.
+""",
 )
