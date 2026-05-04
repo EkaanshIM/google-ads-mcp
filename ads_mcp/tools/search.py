@@ -103,14 +103,14 @@ def count_rows(
     query = "".join(query_parts)
     utils.logger.info(f"ads_mcp.count_rows query {query}")
 
-    result = ga_service.search(
-        customer_id=customer_id,
-        query=query,
-        page_size=1,
-    )
+    request = utils.get_googleads_type("SearchGoogleAdsRequest")
+    request.customer_id = customer_id
+    request.query = query
+    request.page_size = 1
+    request.return_total_results_count = True
 
-    # The Google Ads SearchPager exposes total_results_count from the response
-    # without requiring every row to be sent back through MCP.
+    result = ga_service.search(request=request)
+
     total_results_count = getattr(result, "total_results_count", None)
     if total_results_count is None:
         first_page = next(result.pages, None)
@@ -120,6 +120,7 @@ def count_rows(
         "resource": resource,
         "field": field,
         "conditions": conditions or [],
+        "query": query,
         "total_results_count": int(total_results_count or 0),
     }
 
