@@ -85,6 +85,11 @@ def count_rows(
     resource="campaign", field="campaign.id", and
     conditions=["campaign.status = 'ENABLED'"]. Do not add serving_status or
     performance metric filters unless the user explicitly asks for those.
+    For Merchant Center product enabled/unpaused/servable counts, use
+    resource="shopping_product", field="shopping_product.resource_name", and
+    conditions=["shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED')"].
+    For only fully eligible products, use
+    conditions=["shopping_product.status = 'ELIGIBLE'"].
 
     Args:
         customer_id: The id of the customer
