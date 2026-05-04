@@ -57,6 +57,7 @@ function maxToolSteps() {
 function geminiConfig(tools) {
   return {
     tools,
+    temperature: 0,
     automaticFunctionCalling: {
       maximumRemoteCalls: maxToolSteps()
     },
@@ -110,7 +111,10 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "For conversions, use metrics.conversions unless the user asks for a more specific conversion metric. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
     "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
-    "For questions comparing a period to a 7-day average, fetch the target period and the relevant 7-day comparison period, calculate the average per metric, compare absolute and percentage changes, and identify the largest change. " +
+    "For questions comparing a period to a 7-day average, define the target period explicitly. If the user does not name the target period, use yesterday as the target day and the seven complete days immediately before yesterday as the baseline. " +
+    "For campaign-level 7-day-average comparisons, query all relevant campaigns with campaign.id, campaign.name, segments.date, and the requested metric over the combined target-plus-baseline date range; do not pre-limit to only top campaigns unless the user asks for top campaigns. " +
+    "For 7-day-average comparisons, calculate each entity's baseline average from the seven baseline days, calculate absolute change as target value minus baseline average, calculate percent change as absolute change divided by baseline average, and rank by absolute magnitude of absolute change unless the user specifically asks for largest increase or largest decrease. " +
+    "Before answering ranking questions, self-check that the row you call 'largest' has the greatest absolute change among the rows you report, and separately mention the largest increase and largest decrease when they differ. " +
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
     customerInstruction +
     `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${backendTimeZone()}. ` +
