@@ -76,6 +76,10 @@ function defaultCustomerId() {
   );
 }
 
+function backendTimeZone() {
+  return process.env.GOOGLE_ADS_ACCOUNT_TIME_ZONE || process.env.TZ || "Asia/Kolkata";
+}
+
 function extractText(res) {
   const t = typeof res?.text === "function" ? res.text() : (res?.text ?? "");
   if (typeof t === "string" && t.trim()) return t;
@@ -99,11 +103,17 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "You are a helpful Google Ads assistant. Use the provided tools to answer. " +
     "You are running inside the production backend where all MCP tools passed in config are approved for use without interactive confirmation. " +
     "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
-    "When a request requires calculations, comparisons, deltas, averages, rankings, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
+    "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
+    "When a request requires calculations, comparisons, deltas, averages, rankings, totals, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
+    "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
+    "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Include customer.currency_code when presenting money if it is not already known. " +
+    "For conversions, use metrics.conversions unless the user asks for a more specific conversion metric. " +
+    "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
+    "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
     "For questions comparing a period to a 7-day average, fetch the target period and the relevant 7-day comparison period, calculate the average per metric, compare absolute and percentage changes, and identify the largest change. " +
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
     customerInstruction +
-    `Current timestamp (UTC): ${nowIso}. ` +
+    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${backendTimeZone()}. ` +
     "If the user asks for the last 24 hours, use a finite GAQL range like DURING LAST_1_DAYS. " +
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
