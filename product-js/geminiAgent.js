@@ -105,6 +105,10 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "You are running inside the production backend where all MCP tools passed in config are approved for use without interactive confirmation. " +
     "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
     "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
+    "Always aim for a useful, decision-ready answer: answer the user's direct question first, then add the most meaningful supporting insights available from the fetched data. " +
+    "When tool results include relevant supporting metrics, include them instead of giving a bare one-line answer. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. " +
+    "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
+    "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "When a request requires calculations, comparisons, deltas, averages, rankings, totals, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
     "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
     "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Include customer.currency_code when presenting money if it is not already known. " +
