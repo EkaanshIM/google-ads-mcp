@@ -81,6 +81,49 @@ function backendTimeZone() {
   return process.env.GOOGLE_ADS_ACCOUNT_TIME_ZONE || process.env.TZ || "Asia/Kolkata";
 }
 
+function requestPolicy(message) {
+  const normalized = String(message || "").toLowerCase();
+  const rules = [
+    "Use tools to verify data; do not answer Google Ads counts or metrics from memory.",
+    "For count-only questions, prefer count_rows over search."
+  ];
+
+  if (
+    normalized.includes("campaign") &&
+    (normalized.includes("running") ||
+      normalized.includes("active") ||
+      normalized.includes("live") ||
+      normalized.includes("enabled"))
+  ) {
+    rules.push(
+      "Campaign running/active/live/currently running count means exactly campaign.status = 'ENABLED'.",
+      "Do not include PAUSED or REMOVED campaigns.",
+      "Do not add campaign.serving_status, date, impression, click, cost, or conversion filters unless the user explicitly asks for serving/performance-based campaigns.",
+      "Use count_rows with resource campaign, field campaign.id, and conditions [\"campaign.status = 'ENABLED'\"] for this count."
+    );
+  }
+
+  if (
+    (normalized.includes("product") || normalized.includes("prod") || normalized.includes("feed") || normalized.includes("item")) &&
+    (normalized.includes("count") || normalized.includes("how many") || normalized.includes("total"))
+  ) {
+    rules.push(
+      "Product/feed count questions should count rows, not fetch row listings.",
+      "Usually use count_rows with resource shopping_product and field shopping_product.resource_name.",
+      "If the user asks for current date, add an explicit segments.date condition for today's YYYY-MM-DD date."
+    );
+  }
+
+  if (normalized.includes("7day") || normalized.includes("7-day") || normalized.includes("7 day")) {
+    rules.push(
+      "For 7-day-average comparisons, use yesterday as target when no target day is named and the seven complete days before yesterday as baseline.",
+      "Rank largest change by absolute magnitude unless the user asks specifically for increase or decrease."
+    );
+  }
+
+  return rules.map((rule) => `- ${rule}`).join("\n");
+}
+
 function extractText(res) {
   const t = typeof res?.text === "function" ? res.text() : (res?.text ?? "");
   if (typeof t === "string" && t.trim()) return t;
@@ -133,8 +176,8 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
   const userText = effectiveCustomerId
-    ? `Customer ID: ${effectiveCustomerId}\n\nUser request:\n${message}`
-    : message;
+    ? `Customer ID: ${effectiveCustomerId}\n\nCritical query policy for this request:\n${requestPolicy(message)}\n\nUser request:\n${message}`
+    : `Critical query policy for this request:\n${requestPolicy(message)}\n\nUser request:\n${message}`;
 
   const prompt = `${systemPrefix}\n\n${userText}`;
 

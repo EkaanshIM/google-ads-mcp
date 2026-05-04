@@ -81,6 +81,10 @@ def count_rows(
 
     Use this tool for "count", "how many", "total number of", and inventory-size
     questions where returning every matching row would be too large.
+    For "running", "active", "live", or "enabled" campaign counts, use:
+    resource="campaign", field="campaign.id", and
+    conditions=["campaign.status = 'ENABLED'"]. Do not add serving_status or
+    performance metric filters unless the user explicitly asks for those.
 
     Args:
         customer_id: The id of the customer
