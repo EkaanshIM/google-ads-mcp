@@ -103,18 +103,13 @@ def count_rows(
     query = "".join(query_parts)
     utils.logger.info(f"ads_mcp.count_rows query {query}")
 
-    request = utils.get_googleads_type("SearchGoogleAdsRequest")
-    request.customer_id = customer_id
-    request.query = query
-    request.page_size = 1
-    request.return_total_results_count = True
+    query_result = ga_service.search_stream(
+        customer_id=customer_id, query=query
+    )
 
-    result = ga_service.search(request=request)
-
-    total_results_count = getattr(result, "total_results_count", None)
-    if total_results_count is None:
-        first_page = next(result.pages, None)
-        total_results_count = getattr(first_page, "total_results_count", 0)
+    total_results_count = 0
+    for batch in query_result:
+        total_results_count += len(batch.results)
 
     return {
         "resource": resource,
