@@ -90,6 +90,9 @@ def count_rows(
     conditions=["shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED')"].
     For only fully eligible products, use
     conditions=["shopping_product.status = 'ELIGIBLE'"].
+    For Merchant Center product paused/not servable/ineligible counts, use
+    conditions=["shopping_product.status = 'NOT_ELIGIBLE'"]; Google Ads
+    exposes product eligibility, not a literal product PAUSED enum.
 
     Args:
         customer_id: The id of the customer

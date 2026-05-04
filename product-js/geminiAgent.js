@@ -114,6 +114,18 @@ function requestPolicy(message) {
     );
   }
 
+  if (
+    (normalized.includes("product") || normalized.includes("prod") || normalized.includes("feed") || normalized.includes("item")) &&
+    (normalized.includes("paused") || normalized.includes("unpaused") || normalized.includes("enabled") || normalized.includes("active"))
+  ) {
+    rules.push(
+      "shopping_product.status does not use PAUSED, ENABLED, ACTIVE, or APPROVED.",
+      "For product unpaused/enabled/active/servable counts, use shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED').",
+      "For product paused/not servable/ineligible counts, use shopping_product.status = 'NOT_ELIGIBLE' and state that this is the Google Ads eligibility equivalent, not a literal Merchant Center pause flag.",
+      "Use count_rows with resource shopping_product and field shopping_product.resource_name for product eligibility counts."
+    );
+  }
+
   if (normalized.includes("7day") || normalized.includes("7-day") || normalized.includes("7 day")) {
     rules.push(
       "For 7-day-average comparisons, use yesterday as target when no target day is named and the seven complete days before yesterday as baseline.",
@@ -153,7 +165,7 @@ export async function runGeminiWithMcp({ message, customerId }) {
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
-    "For Merchant Center product enabled/unpaused/servable/active product questions in Google Ads, use shopping_product.status values from ProductStatus: ELIGIBLE means can show in ads, ELIGIBLE_LIMITED means can show with limitations, and NOT_ELIGIBLE means cannot show. Do not try ENABLED, ACTIVE, or APPROVED for shopping_product.status. For enabled/unpaused product counts, usually count shopping_product rows where shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED') unless the user wants only fully eligible products, in which case use shopping_product.status = 'ELIGIBLE'. " +
+    "For Merchant Center product enabled/unpaused/servable/active product questions in Google Ads, use shopping_product.status values from ProductStatus: ELIGIBLE means can show in ads, ELIGIBLE_LIMITED means can show with limitations, and NOT_ELIGIBLE means cannot show. Do not try PAUSED, ENABLED, ACTIVE, or APPROVED for shopping_product.status. For enabled/unpaused product counts, usually count shopping_product rows where shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED') unless the user wants only fully eligible products, in which case use shopping_product.status = 'ELIGIBLE'. For paused/not servable/ineligible product counts, count shopping_product.status = 'NOT_ELIGIBLE' and explain that Google Ads exposes this as eligibility, not a literal product pause flag. " +
     "For campaign status questions, interpret running, active, live, currently running, or enabled campaigns as campaign.status = 'ENABLED'. Do not include PAUSED or REMOVED campaigns in a running/active/live count unless the user explicitly asks for paused, inactive, all statuses, or a status breakdown. " +
     "For simple campaign counts, use count_rows on the campaign resource with field campaign.id and the appropriate status condition instead of fetching every campaign row. " +
     "For broad listing questions, request only the fields needed, always use a LIMIT, and summarize instead of returning huge raw result sets. If the user asks for all rows and the result may be large, ask them to narrow the request or provide a small sample with the total count. " +
