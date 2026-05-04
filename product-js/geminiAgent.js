@@ -1,4 +1,4 @@
-import { GoogleGenAI, mcpToTool } from "@google/genai";
+import { FunctionCallingConfigMode, GoogleGenAI, mcpToTool } from "@google/genai";
 import { getMcpClient } from "./mcp.js";
 
 function requireEnv(name) {
@@ -48,6 +48,26 @@ function modelName() {
   return process.env.GEMINI_MODEL || "gemini-2.0-flash";
 }
 
+function maxToolSteps() {
+  const raw = process.env.GEMINI_MAX_TOOL_STEPS || "50";
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 50;
+}
+
+function geminiConfig(tools) {
+  return {
+    tools,
+    automaticFunctionCalling: {
+      maximumRemoteCalls: maxToolSteps()
+    },
+    toolConfig: {
+      functionCallingConfig: {
+        mode: FunctionCallingConfigMode.AUTO
+      }
+    }
+  };
+}
+
 function defaultCustomerId() {
   return (
     process.env.DEFAULT_CUSTOMER_ID ||
@@ -77,6 +97,10 @@ export async function runGeminiWithMcp({ message, customerId }) {
     : "";
   const systemPrefix =
     "You are a helpful Google Ads assistant. Use the provided tools to answer. " +
+    "You are running inside the production backend where all MCP tools passed in config are approved for use without interactive confirmation. " +
+    "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
+    "When a request requires calculations, comparisons, deltas, averages, rankings, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
+    "For questions comparing a period to a 7-day average, fetch the target period and the relevant 7-day comparison period, calculate the average per metric, compare absolute and percentage changes, and identify the largest change. " +
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
     customerInstruction +
     `Current timestamp (UTC): ${nowIso}. ` +
@@ -94,11 +118,12 @@ export async function runGeminiWithMcp({ message, customerId }) {
   // function calling + tool execution automatically.
   const mcpClient = await getMcpClient();
   const tools = [mcpToTool(mcpClient)];
+  const config = geminiConfig(tools);
 
   const res1 = await ai.models.generateContent({
     model: modelName(),
     contents: prompt,
-    config: { tools }
+    config
   });
 
   let text = extractText(res1);
@@ -109,7 +134,7 @@ export async function runGeminiWithMcp({ message, customerId }) {
       contents:
         prompt +
         "\n\nIMPORTANT: Provide a final plain-English answer summarizing the tool results. Do not return empty output.",
-      config: { tools }
+      config
     });
     text = extractText(res2);
   }

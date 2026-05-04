@@ -51,3 +51,9 @@ Open:
 - If you prefer running the MCP server via `pipx`, set `MCP_SERVER_COMMAND` and
   `MCP_SERVER_ARGS` in `.env`.
 - For Vertex AI, set `GOOGLE_GENAI_USE_VERTEXAI=true` and configure ADC.
+- `GEMINI_MAX_TOOL_STEPS` controls how many automatic MCP tool calls the Gemini
+  SDK can make for one answer. Keep it high enough for multi-query analytics
+  such as 7-day average comparisons.
+- This Node server uses the Gemini API directly. It does not depend on Gemini
+  CLI approval settings in production; all MCP tools supplied by the backend are
+  available to Gemini automatically through the SDK.
