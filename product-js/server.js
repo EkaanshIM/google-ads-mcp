@@ -257,11 +257,28 @@ async function queueChatJob(job) {
     await updateJob(job.id, {
       status: "failed",
       completedAt: new Date().toISOString(),
-      error: e?.message ?? String(e)
+      error: publicErrorMessage(e)
     });
   } finally {
     activeJobPromises.delete(job.id);
   }
+}
+
+function publicErrorMessage(error) {
+  const message = error?.message ?? String(error);
+  const lower = message.toLowerCase();
+  if (
+    lower.includes("input token count") ||
+    lower.includes("maximum number of tokens") ||
+    lower.includes("exceeds the maximum")
+  ) {
+    return [
+      "The request produced too much raw data for Gemini to process safely.",
+      "For count-style questions, ask for a count/summary rather than all rows. This backend now includes a count_rows tool so product/feed counts can be answered without loading every product row.",
+      "If you still see this after redeploy, narrow the request by date, resource, status, or ask for a sample plus total count."
+    ].join(" ");
+  }
+  return message;
 }
 
 function serializeChatResponse(job) {

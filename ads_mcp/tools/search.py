@@ -70,6 +70,56 @@ def search(
     return final_output
 
 
+@mcp.tool()
+def count_rows(
+    customer_id: str,
+    resource: str,
+    field: str,
+    conditions: List[str] = None,
+) -> Dict[str, Any]:
+    """Counts rows matching a Google Ads API search without returning all rows.
+
+    Use this tool for "count", "how many", "total number of", and inventory-size
+    questions where returning every matching row would be too large.
+
+    Args:
+        customer_id: The id of the customer
+        resource: The resource to count
+        field: A selectable field from the resource, usually resource_name or id
+        conditions: List of conditions to filter the data, combined using AND clauses
+    """
+
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+
+    query_parts = [f"SELECT {field} FROM {resource}"]
+    if conditions:
+        query_parts.append(f" WHERE {' AND '.join(conditions)}")
+    query_parts.append(" PARAMETERS omit_unselected_resource_names=true")
+
+    query = "".join(query_parts)
+    utils.logger.info(f"ads_mcp.count_rows query {query}")
+
+    result = ga_service.search(
+        customer_id=customer_id,
+        query=query,
+        page_size=1,
+    )
+
+    # The Google Ads SearchPager exposes total_results_count from the response
+    # without requiring every row to be sent back through MCP.
+    total_results_count = getattr(result, "total_results_count", None)
+    if total_results_count is None:
+        first_page = next(result.pages, None)
+        total_results_count = getattr(first_page, "total_results_count", 0)
+
+    return {
+        "resource": resource,
+        "field": field,
+        "conditions": conditions or [],
+        "total_results_count": int(total_results_count or 0),
+    }
+
+
 def _search_tool_description() -> str:
     """Returns the description for the `search` tool."""
     # Add a warning that will be part of the description
