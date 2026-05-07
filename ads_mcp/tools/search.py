@@ -16,6 +16,9 @@
 
 from datetime import datetime, timedelta
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 from typing import Any, Dict, List
 from ads_mcp.coordinator import mcp
 import ads_mcp.utils as utils
@@ -35,6 +38,38 @@ _METRIC_ALIASES = {
     "conversion": "metrics.conversions",
     "cost_per_conversion": "metrics.cost_per_conversion",
 }
+
+_PRODUCT_CAMPAIGN_OVERLAP_CACHE: Dict[Any, Dict[str, Any]] = {}
+_PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK = threading.Lock()
+_PRODUCT_CAMPAIGN_OVERLAP_CACHE_TTL_SECONDS = 600
+_PRODUCT_CAMPAIGN_OVERLAP_CACHE_MAX_ITEMS = 32
+
+
+def _cache_get(cache: Dict[Any, Dict[str, Any]], lock, key):
+    now = time.monotonic()
+    with lock:
+        cached = cache.get(key)
+        if not cached:
+            return None
+        if now - cached["created_at"] > cached["ttl_seconds"]:
+            cache.pop(key, None)
+            return None
+        value = dict(cached["value"])
+        value["cache_hit"] = True
+        value["cache_age_seconds"] = round(now - cached["created_at"], 2)
+        return value
+
+
+def _cache_set(cache: Dict[Any, Dict[str, Any]], lock, key, value, ttl_seconds):
+    with lock:
+        if len(cache) >= _PRODUCT_CAMPAIGN_OVERLAP_CACHE_MAX_ITEMS:
+            oldest_key = min(cache.items(), key=lambda item: item[1]["created_at"])[0]
+            cache.pop(oldest_key, None)
+        cache[key] = {
+            "created_at": time.monotonic(),
+            "ttl_seconds": ttl_seconds,
+            "value": dict(value),
+        }
 
 
 def _metric_field(metric: str) -> str:
@@ -568,7 +603,9 @@ def count_products_in_multiple_campaigns(
     campaign_status: str = "ENABLED",
     product_status_group: str = "enabled",
     sample_size: int = 10,
-    max_campaigns: int = 25,
+    max_campaigns: int = 250,
+    max_concurrency: int = 5,
+    time_budget_seconds: int = 50,
 ) -> Dict[str, Any]:
     """Counts shopping products included in at least N different campaigns.
 
@@ -587,11 +624,34 @@ def count_products_in_multiple_campaigns(
         sample_size: Number of matching product samples to return
         max_campaigns: Maximum campaign-scoped product queries to run before
             returning partial results
+        max_concurrency: Maximum campaign product queries to run at once
+        time_budget_seconds: Stop launching new work near this budget and
+            return partial results instead of timing out
     """
 
+    started_at = time.monotonic()
     final_min_campaign_count = max(2, int(min_campaign_count or 2))
     final_sample_size = max(0, min(int(sample_size or 10), 25))
-    final_max_campaigns = max(1, min(int(max_campaigns or 25), 100))
+    final_max_campaigns = max(1, min(int(max_campaigns or 250), 500))
+    final_max_concurrency = max(1, min(int(max_concurrency or 5), 10))
+    final_time_budget_seconds = max(10, min(int(time_budget_seconds or 50), 120))
+    cache_key = (
+        customer_id,
+        final_min_campaign_count,
+        campaign_status,
+        product_status_group,
+        final_sample_size,
+        final_max_campaigns,
+        final_max_concurrency,
+    )
+    cached = _cache_get(
+        _PRODUCT_CAMPAIGN_OVERLAP_CACHE,
+        _PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK,
+        cache_key,
+    )
+    if cached:
+        return cached
+
     campaign_conditions = _status_condition("campaign", campaign_status)
     campaign_conditions.append(
         "campaign.advertising_channel_type IN ('SHOPPING', 'PERFORMANCE_MAX')"
@@ -615,14 +675,16 @@ def count_products_in_multiple_campaigns(
     product_campaign_pair_count = 0
     skipped_campaigns = []
     processed_campaigns = 0
+    timed_out_before_full_scan = False
 
-    for campaign in campaigns[:final_max_campaigns]:
+    campaigns_to_scan = campaigns[:final_max_campaigns]
+
+    def fetch_campaign_products(campaign: Dict[str, Any]) -> Dict[str, Any]:
         campaign_id = _row_value(campaign, "campaign.id")
         campaign_name = _row_value(campaign, "campaign.name")
         if not campaign_id:
-            continue
+            return {"campaign": campaign, "rows": [], "skipped": None}
 
-        processed_campaigns += 1
         campaign_resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
         conditions = [
             f"shopping_product.campaign = '{campaign_resource_name}'",
@@ -642,38 +704,67 @@ def count_products_in_multiple_campaigns(
                 conditions=conditions,
                 limit=100000,
             )
+            return {"campaign": campaign, "rows": rows, "skipped": None}
         except Exception as error:
-            skipped_campaigns.append(
-                {
+            return {
+                "campaign": campaign,
+                "rows": [],
+                "skipped": {
                     "campaign_id": campaign_id,
                     "campaign_name": campaign_name,
                     "error": str(error),
-                }
-            )
-            continue
-
-        for row in rows:
-            product_key = str(
-                _row_value(row, "shopping_product.item_id")
-                or _row_value(row, "shopping_product.resource_name")
-            )
-            if not product_key:
-                continue
-
-            product_campaign_pair_count += 1
-            entry = product_campaigns.setdefault(
-                product_key,
-                {
-                    "item_id": _row_value(row, "shopping_product.item_id"),
-                    "resource_name": _row_value(row, "shopping_product.resource_name"),
-                    "status": _row_value(row, "shopping_product.status"),
-                    "campaigns": {},
                 },
-            )
-            entry["campaigns"][str(campaign_id)] = {
-                "campaign_id": campaign_id,
-                "campaign_name": campaign_name,
             }
+
+    with ThreadPoolExecutor(max_workers=final_max_concurrency) as executor:
+        next_index = 0
+        while next_index < len(campaigns_to_scan):
+            elapsed = time.monotonic() - started_at
+            if elapsed >= final_time_budget_seconds:
+                timed_out_before_full_scan = True
+                break
+
+            batch = campaigns_to_scan[next_index : next_index + final_max_concurrency]
+            next_index += len(batch)
+            futures = [executor.submit(fetch_campaign_products, campaign) for campaign in batch]
+
+            for future in as_completed(futures):
+                result = future.result()
+                campaign = result["campaign"]
+                campaign_id = _row_value(campaign, "campaign.id")
+                campaign_name = _row_value(campaign, "campaign.name")
+                skipped = result.get("skipped")
+                if skipped:
+                    skipped_campaigns.append(skipped)
+                    continue
+
+                processed_campaigns += 1
+                rows = result["rows"]
+
+                for row in rows:
+                    product_key = str(
+                        _row_value(row, "shopping_product.item_id")
+                        or _row_value(row, "shopping_product.resource_name")
+                    )
+                    if not product_key:
+                        continue
+
+                    product_campaign_pair_count += 1
+                    entry = product_campaigns.setdefault(
+                        product_key,
+                        {
+                            "item_id": _row_value(row, "shopping_product.item_id"),
+                            "resource_name": _row_value(
+                                row, "shopping_product.resource_name"
+                            ),
+                            "status": _row_value(row, "shopping_product.status"),
+                            "campaigns": {},
+                        },
+                    )
+                    entry["campaigns"][str(campaign_id)] = {
+                        "campaign_id": campaign_id,
+                        "campaign_name": campaign_name,
+                    }
 
     matching_products = [
         {
@@ -688,7 +779,12 @@ def count_products_in_multiple_campaigns(
     ]
     matching_products.sort(key=lambda item: item["campaign_count"], reverse=True)
 
-    return {
+    is_partial = (
+        len(campaigns) > len(campaigns_to_scan)
+        or len(campaigns_to_scan) > processed_campaigns + len(skipped_campaigns)
+        or timed_out_before_full_scan
+    )
+    result = {
         "customer_id": customer_id,
         "min_campaign_count": final_min_campaign_count,
         "campaign_status": campaign_status,
@@ -696,7 +792,19 @@ def count_products_in_multiple_campaigns(
         "campaigns_scanned": processed_campaigns,
         "campaigns_available": len(campaigns),
         "max_campaigns": final_max_campaigns,
-        "is_partial": len(campaigns) > processed_campaigns,
+        "max_concurrency": final_max_concurrency,
+        "time_budget_seconds": final_time_budget_seconds,
+        "elapsed_seconds": round(time.monotonic() - started_at, 2),
+        "is_partial": is_partial,
+        "partial_reason": (
+            "time_budget_exceeded"
+            if timed_out_before_full_scan
+            else "max_campaigns_below_available"
+            if len(campaigns) > len(campaigns_to_scan)
+            else "some_campaigns_failed_or_unprocessed"
+            if is_partial
+            else None
+        ),
         "campaigns_skipped": skipped_campaigns,
         "unique_products_scanned": len(product_campaigns),
         "product_campaign_pair_count": product_campaign_pair_count,
@@ -706,11 +814,20 @@ def count_products_in_multiple_campaigns(
             "shopping_product.campaign requires an equality filter, so this "
             "tool decomposes the task into one valid campaign-scope query per "
             "campaign and compares product item IDs server-side. To avoid MCP "
-            "timeouts, it scans Shopping and Performance Max campaigns first "
-            "and returns partial results when max_campaigns is lower than the "
-            "available campaign count."
+            "timeouts, it scans Shopping and Performance Max campaigns in "
+            "parallel batches, caches repeated requests briefly, and returns "
+            "partial results if the requested scope exceeds max_campaigns or "
+            "the time budget."
         ),
     }
+    _cache_set(
+        _PRODUCT_CAMPAIGN_OVERLAP_CACHE,
+        _PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK,
+        cache_key,
+        result,
+        _PRODUCT_CAMPAIGN_OVERLAP_CACHE_TTL_SECONDS,
+    )
+    return result
 
 
 @mcp.tool()
