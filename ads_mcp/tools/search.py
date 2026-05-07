@@ -14,9 +14,143 @@
 
 """Tools for exposing the API Search method to the MCP server."""
 
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 from ads_mcp.coordinator import mcp
 import ads_mcp.utils as utils
+
+
+_METRIC_ALIASES = {
+    "clicks": "metrics.clicks",
+    "impressions": "metrics.impressions",
+    "ctr": "metrics.ctr",
+    "average_cpc": "metrics.average_cpc",
+    "avg_cpc": "metrics.average_cpc",
+    "cpc": "metrics.average_cpc",
+    "cost": "metrics.cost_micros",
+    "cost_micros": "metrics.cost_micros",
+    "conversions": "metrics.conversions",
+    "conversion": "metrics.conversions",
+    "cost_per_conversion": "metrics.cost_per_conversion",
+}
+
+
+def _metric_field(metric: str) -> str:
+    if not metric:
+        return "metrics.conversions"
+    normalized = metric.strip().lower()
+    if normalized.startswith("metrics."):
+        return normalized
+    return _METRIC_ALIASES.get(normalized, f"metrics.{normalized}")
+
+
+def _row_value(row: Dict[str, Any], field: str, default: Any = 0) -> Any:
+    return row.get(field, default)
+
+
+def _row_float(row: Dict[str, Any], field: str, default: float = 0.0) -> float:
+    value = _row_value(row, field, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _date(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
+def _date_range_conditions(
+    date_start: str | None, date_end: str | None
+) -> List[str]:
+    if date_start and date_end:
+        return [f"segments.date BETWEEN '{date_start}' AND '{date_end}'"]
+    if date_start:
+        return [f"segments.date >= '{date_start}'"]
+    if date_end:
+        return [f"segments.date <= '{date_end}'"]
+    return []
+
+
+def _status_condition(resource: str, status: str | None) -> List[str]:
+    if not status or status.upper() in {"ALL", "ANY"}:
+        return []
+    return [f"{resource}.status = '{status.upper()}'"]
+
+
+def _money_units(value_micros: float) -> float:
+    return value_micros / 1_000_000
+
+
+def _campaign_metric_bundle(row: Dict[str, Any]) -> Dict[str, Any]:
+    cost_micros = _row_float(row, "metrics.cost_micros")
+    avg_cpc_micros = _row_float(row, "metrics.average_cpc")
+    conversions = _row_float(row, "metrics.conversions")
+    return {
+        "campaign_id": _row_value(row, "campaign.id"),
+        "campaign_name": _row_value(row, "campaign.name"),
+        "campaign_status": _row_value(row, "campaign.status"),
+        "clicks": _row_float(row, "metrics.clicks"),
+        "impressions": _row_float(row, "metrics.impressions"),
+        "ctr": _row_float(row, "metrics.ctr"),
+        "average_cpc": _money_units(avg_cpc_micros),
+        "cost": _money_units(cost_micros),
+        "cost_micros": cost_micros,
+        "conversions": conversions,
+        "cost_per_conversion": (
+            _money_units(cost_micros) / conversions if conversions else None
+        ),
+        "currency_code": _row_value(row, "customer.currency_code", ""),
+    }
+
+
+def _campaign_score(metrics: Dict[str, Any], metric: str, scoring_mode: str):
+    normalized_metric = (metric or "").strip().lower()
+    normalized_mode = (scoring_mode or "").strip().lower()
+
+    if normalized_mode == "balanced" or normalized_metric in {
+        "",
+        "performance",
+        "balanced",
+    }:
+        # Deterministic general-purpose score. Conversions are weighted highest,
+        # while CTR, clicks, and lower CPC add secondary signal.
+        return (
+            (metrics["conversions"] * 1000)
+            + metrics["clicks"]
+            + (metrics["ctr"] * 10000)
+            - ((metrics["average_cpc"] or 0) * 10)
+        )
+
+    if normalized_metric in {"average_cpc", "avg_cpc", "cpc"}:
+        return -(metrics["average_cpc"] or 0)
+    if normalized_metric == "cost_per_conversion":
+        value = metrics["cost_per_conversion"]
+        return -value if value is not None else float("-inf")
+    if normalized_metric in {"cost", "spend", "cost_micros"}:
+        return metrics["cost"]
+    if normalized_metric == "ctr":
+        return metrics["ctr"]
+    if normalized_metric == "clicks":
+        return metrics["clicks"]
+    if normalized_metric == "impressions":
+        return metrics["impressions"]
+    return metrics["conversions"]
+
+
+def _product_status_conditions(status_group: str | None) -> List[str]:
+    normalized = (status_group or "all").strip().lower()
+    if normalized in {"all", "any", ""}:
+        return []
+    if normalized in {"enabled", "unpaused", "active", "servable", "eligible_or_limited"}:
+        return ["shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED')"]
+    if normalized in {"eligible", "fully_eligible"}:
+        return ["shopping_product.status = 'ELIGIBLE'"]
+    if normalized in {"limited", "eligible_limited"}:
+        return ["shopping_product.status = 'ELIGIBLE_LIMITED'"]
+    if normalized in {"paused", "ineligible", "not_eligible", "not servable", "not_servable"}:
+        return ["shopping_product.status = 'NOT_ELIGIBLE'"]
+    return [f"shopping_product.status = '{status_group.upper()}'"]
 
 
 def search(
@@ -125,6 +259,323 @@ def count_rows(
         "conditions": conditions or [],
         "query": query,
         "total_results_count": int(total_results_count or 0),
+    }
+
+
+@mcp.tool()
+def count_entities(
+    customer_id: str,
+    resource: str,
+    field: str,
+    conditions: List[str] = None,
+    status: str = None,
+    date_start: str = None,
+    date_end: str = None,
+) -> Dict[str, Any]:
+    """Counts entities with optional status and date filters.
+
+    Use this for generic entity count questions instead of fetching all rows.
+
+    Args:
+        customer_id: The id of the customer
+        resource: Google Ads resource to count, e.g. campaign or shopping_product
+        field: Selectable identifier field, e.g. campaign.id
+        conditions: Additional GAQL conditions
+        status: Optional status enum for resources with a status field
+        date_start: Optional YYYY-MM-DD start date for segments.date
+        date_end: Optional YYYY-MM-DD end date for segments.date
+    """
+
+    final_conditions = []
+    final_conditions.extend(conditions or [])
+    final_conditions.extend(_status_condition(resource, status))
+    final_conditions.extend(_date_range_conditions(date_start, date_end))
+    return count_rows(
+        customer_id=customer_id,
+        resource=resource,
+        field=field,
+        conditions=final_conditions,
+    )
+
+
+@mcp.tool()
+def rank_campaigns(
+    customer_id: str,
+    date_start: str,
+    date_end: str,
+    metric: str = "performance",
+    scoring_mode: str = "balanced",
+    top_n: int = 5,
+    status: str = "ENABLED",
+) -> Dict[str, Any]:
+    """Ranks campaigns deterministically for a date range.
+
+    Use this for top/bottom/best/worst campaign performance questions. It fetches
+    a full campaign candidate set, computes scores in code, and returns compact
+    best/worst lists with supporting metrics.
+
+    Args:
+        customer_id: The id of the customer
+        date_start: YYYY-MM-DD start date
+        date_end: YYYY-MM-DD end date
+        metric: Ranking metric or "performance" for balanced scoring
+        scoring_mode: "balanced" or "metric"
+        top_n: Number of best and worst campaigns to return
+        status: Campaign status filter, usually ENABLED; use ALL for no status filter
+    """
+
+    final_top_n = max(1, min(int(top_n or 5), 25))
+    fields = [
+        "campaign.id",
+        "campaign.name",
+        "campaign.status",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.ctr",
+        "metrics.average_cpc",
+        "metrics.cost_micros",
+        "metrics.conversions",
+        "customer.currency_code",
+    ]
+    conditions = []
+    conditions.extend(_status_condition("campaign", status))
+    conditions.extend(_date_range_conditions(date_start, date_end))
+
+    rows = search(
+        customer_id=customer_id,
+        fields=fields,
+        resource="campaign",
+        conditions=conditions,
+        limit=5000,
+    )
+
+    ranked = []
+    for row in rows:
+        metrics = _campaign_metric_bundle(row)
+        score = _campaign_score(metrics, metric, scoring_mode)
+        ranked.append({**metrics, "score": score})
+
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "customer_id": customer_id,
+        "date_start": date_start,
+        "date_end": date_end,
+        "status": status,
+        "metric": metric,
+        "scoring_mode": scoring_mode,
+        "scoring_note": (
+            "Balanced score weights conversions highest, then clicks and CTR, "
+            "with lower CPC as a small positive signal."
+            if (scoring_mode or "").lower() == "balanced"
+            or (metric or "").lower() in {"performance", "balanced", ""}
+            else "Metric score uses the requested metric directly; lower is better for CPC metrics."
+        ),
+        "candidate_count": len(ranked),
+        "best": ranked[:final_top_n],
+        "worst": list(reversed(ranked[-final_top_n:])) if ranked else [],
+    }
+
+
+@mcp.tool()
+def compare_campaigns_to_7day_average(
+    customer_id: str,
+    metric: str,
+    target_date: str,
+    top_n: int = 5,
+    status: str = "ENABLED",
+) -> Dict[str, Any]:
+    """Compares campaign target-day metric values to the prior 7-day average.
+
+    Use this for "largest change vs 7-day average" campaign questions.
+
+    Args:
+        customer_id: The id of the customer
+        metric: Metric to compare, e.g. conversions, clicks, cost
+        target_date: Target date in YYYY-MM-DD
+        top_n: Number of changes to return
+        status: Campaign status filter, usually ENABLED; use ALL for no status filter
+    """
+
+    metric_field = _metric_field(metric)
+    target_dt = _date(target_date)
+    baseline_start = (target_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    baseline_end = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    combined_start = baseline_start
+    combined_end = target_date
+    final_top_n = max(1, min(int(top_n or 5), 25))
+
+    fields = ["campaign.id", "campaign.name", "campaign.status", "segments.date", metric_field]
+    conditions = []
+    conditions.extend(_status_condition("campaign", status))
+    conditions.extend(_date_range_conditions(combined_start, combined_end))
+
+    rows = search(
+        customer_id=customer_id,
+        fields=fields,
+        resource="campaign",
+        conditions=conditions,
+        limit=10000,
+    )
+
+    by_campaign: Dict[Any, Dict[str, Any]] = {}
+    for row in rows:
+        campaign_id = _row_value(row, "campaign.id")
+        entry = by_campaign.setdefault(
+            campaign_id,
+            {
+                "campaign_id": campaign_id,
+                "campaign_name": _row_value(row, "campaign.name"),
+                "daily": {},
+            },
+        )
+        entry["daily"][_row_value(row, "segments.date")] = _row_float(row, metric_field)
+
+    changes = []
+    baseline_dates = [
+        (target_dt - timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(7, 0, -1)
+    ]
+    for entry in by_campaign.values():
+        baseline_values = [entry["daily"].get(day, 0.0) for day in baseline_dates]
+        baseline_avg = sum(baseline_values) / 7
+        target_value = entry["daily"].get(target_date, 0.0)
+        absolute_change = target_value - baseline_avg
+        pct_change = (
+            (absolute_change / baseline_avg) * 100 if baseline_avg else None
+        )
+        changes.append(
+            {
+                "campaign_id": entry["campaign_id"],
+                "campaign_name": entry["campaign_name"],
+                "metric": metric_field,
+                "target_date": target_date,
+                "target_value": target_value,
+                "baseline_start": baseline_start,
+                "baseline_end": baseline_end,
+                "baseline_average": baseline_avg,
+                "absolute_change": absolute_change,
+                "percent_change": pct_change,
+            }
+        )
+
+    by_abs = sorted(changes, key=lambda item: abs(item["absolute_change"]), reverse=True)
+    by_increase = sorted(changes, key=lambda item: item["absolute_change"], reverse=True)
+    by_decrease = sorted(changes, key=lambda item: item["absolute_change"])
+    return {
+        "customer_id": customer_id,
+        "metric": metric_field,
+        "target_date": target_date,
+        "baseline_start": baseline_start,
+        "baseline_end": baseline_end,
+        "status": status,
+        "candidate_count": len(changes),
+        "largest_changes": by_abs[:final_top_n],
+        "largest_increases": by_increase[:final_top_n],
+        "largest_decreases": by_decrease[:final_top_n],
+    }
+
+
+@mcp.tool()
+def product_status_breakdown(customer_id: str) -> Dict[str, Any]:
+    """Returns Merchant Center shopping product counts by eligibility status."""
+
+    statuses = ["ELIGIBLE", "ELIGIBLE_LIMITED", "NOT_ELIGIBLE"]
+    breakdown = {}
+    for status in statuses:
+        result = count_rows(
+            customer_id=customer_id,
+            resource="shopping_product",
+            field="shopping_product.resource_name",
+            conditions=[f"shopping_product.status = '{status}'"],
+        )
+        breakdown[status] = result["total_results_count"]
+
+    return {
+        "customer_id": customer_id,
+        "breakdown": breakdown,
+        "enabled_unpaused_servable_count": breakdown["ELIGIBLE"]
+        + breakdown["ELIGIBLE_LIMITED"],
+        "paused_not_servable_ineligible_count": breakdown["NOT_ELIGIBLE"],
+        "note": (
+            "Google Ads exposes Merchant Center product ad eligibility as "
+            "shopping_product.status. There is no literal PAUSED product enum."
+        ),
+    }
+
+
+@mcp.tool()
+def count_products_by_status(
+    customer_id: str, status_group: str = "enabled"
+) -> Dict[str, Any]:
+    """Counts shopping products by business status group.
+
+    Args:
+        customer_id: The id of the customer
+        status_group: enabled/unpaused/active/servable, eligible, limited,
+            paused/ineligible/not_eligible/not_servable, or all
+    """
+
+    conditions = _product_status_conditions(status_group)
+    result = count_rows(
+        customer_id=customer_id,
+        resource="shopping_product",
+        field="shopping_product.resource_name",
+        conditions=conditions,
+    )
+    return {
+        **result,
+        "status_group": status_group,
+        "note": (
+            "enabled/unpaused/servable maps to ELIGIBLE + ELIGIBLE_LIMITED; "
+            "paused/not servable maps to NOT_ELIGIBLE."
+        ),
+    }
+
+
+@mcp.tool()
+def account_metric_summary(
+    customer_id: str,
+    date_start: str,
+    date_end: str,
+    metrics: List[str],
+) -> Dict[str, Any]:
+    """Returns account-level metric totals for a finite date range.
+
+    Args:
+        customer_id: The id of the customer
+        date_start: YYYY-MM-DD start date
+        date_end: YYYY-MM-DD end date
+        metrics: Metric aliases or full metrics.* fields
+    """
+
+    metric_fields = [_metric_field(metric) for metric in metrics]
+    fields = [
+        "customer.descriptive_name",
+        "customer.currency_code",
+        *metric_fields,
+    ]
+    rows = search(
+        customer_id=customer_id,
+        fields=fields,
+        resource="customer",
+        conditions=_date_range_conditions(date_start, date_end),
+        limit=1,
+    )
+    row = rows[0] if rows else {}
+    summary = {field: _row_value(row, field, 0) for field in metric_fields}
+    if "metrics.cost_micros" in summary:
+        summary["cost"] = _money_units(float(summary["metrics.cost_micros"] or 0))
+    if "metrics.average_cpc" in summary:
+        summary["average_cpc"] = _money_units(
+            float(summary["metrics.average_cpc"] or 0)
+        )
+    return {
+        "customer_id": customer_id,
+        "account_name": _row_value(row, "customer.descriptive_name"),
+        "currency_code": _row_value(row, "customer.currency_code"),
+        "date_start": date_start,
+        "date_end": date_end,
+        "metrics": summary,
     }
 
 

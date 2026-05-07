@@ -86,7 +86,8 @@ function requestPolicy(message) {
   const normalized = String(message || "").toLowerCase();
   const rules = [
     "Use tools to verify data; do not answer Google Ads counts or metrics from memory.",
-    "For count-only questions, prefer count_rows over search."
+    "For count-only questions, prefer count_entities/count_rows over search.",
+    "For campaign ranking, product status, 7-day comparison, or account summary questions, prefer deterministic analytics tools over raw search."
   ];
 
   if (
@@ -100,7 +101,7 @@ function requestPolicy(message) {
       "Campaign running/active/live/currently running count means exactly campaign.status = 'ENABLED'.",
       "Do not include PAUSED or REMOVED campaigns.",
       "Do not add campaign.serving_status, date, impression, click, cost, or conversion filters unless the user explicitly asks for serving/performance-based campaigns.",
-      "Use count_rows with resource campaign, field campaign.id, and conditions [\"campaign.status = 'ENABLED'\"] for this count."
+      "Use count_entities or count_rows with resource campaign, field campaign.id, and conditions [\"campaign.status = 'ENABLED'\"] for this count."
     );
   }
 
@@ -123,7 +124,7 @@ function requestPolicy(message) {
       "shopping_product.status does not use PAUSED, ENABLED, ACTIVE, or APPROVED.",
       "For product unpaused/enabled/active/servable counts, use shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED').",
       "For product paused/not servable/ineligible counts, use shopping_product.status = 'NOT_ELIGIBLE' and state that this is the Google Ads eligibility equivalent, not a literal Merchant Center pause flag.",
-      "Use count_rows with resource shopping_product and field shopping_product.resource_name for product eligibility counts."
+      "Use count_products_by_status or product_status_breakdown for product eligibility counts."
     );
   }
 
@@ -147,6 +148,7 @@ function requestPolicy(message) {
   ) {
     rules.push(
       "For campaign best/worst/top/bottom performance questions, do not use an unordered limited sample. Add campaign.status = 'ENABLED' unless the user asks for all campaign statuses.",
+      "Prefer the rank_campaigns tool for campaign best/worst/top/bottom performance questions.",
       "Fetch enough rows to rank the full candidate set; use limit 1000 or higher for campaign-level ranking unless a smaller top-N is explicitly paired with ORDER BY on the ranking metric.",
       "Include supporting fields: campaign.id, campaign.name, metrics.clicks, metrics.impressions, metrics.ctr, metrics.average_cpc, metrics.cost_micros, metrics.conversions, and customer.currency_code when available.",
       "If the user does not specify a ranking metric, rank best by a balanced performance view using conversions, cost efficiency, clicks, CTR, and CPC; state the primary metric/scoring rule used.",
@@ -229,6 +231,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
+    "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown and count_products_by_status for Merchant Center product eligibility counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
     "For Merchant Center product enabled/unpaused/servable/active product questions in Google Ads, use shopping_product.status values from ProductStatus: ELIGIBLE means can show in ads, ELIGIBLE_LIMITED means can show with limitations, and NOT_ELIGIBLE means cannot show. Do not try PAUSED, ENABLED, ACTIVE, or APPROVED for shopping_product.status. For enabled/unpaused product counts, usually count shopping_product rows where shopping_product.status IN ('ELIGIBLE', 'ELIGIBLE_LIMITED') unless the user wants only fully eligible products, in which case use shopping_product.status = 'ELIGIBLE'. For paused/not servable/ineligible product counts, count shopping_product.status = 'NOT_ELIGIBLE' and explain that Google Ads exposes this as eligibility, not a literal product pause flag. " +
     "For campaign status questions, interpret running, active, live, currently running, or enabled campaigns as campaign.status = 'ENABLED'. Do not include PAUSED or REMOVED campaigns in a running/active/live count unless the user explicitly asks for paused, inactive, all statuses, or a status breakdown. " +
     "For simple campaign counts, use count_rows on the campaign resource with field campaign.id and the appropriate status condition instead of fetching every campaign row. " +
