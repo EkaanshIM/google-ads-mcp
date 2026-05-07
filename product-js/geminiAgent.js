@@ -171,8 +171,8 @@ function extractText(res) {
 }
 
 function includeTraceInResponse() {
-  const value = String(process.env.DEBUG_TRACE_IN_RESPONSE || "true").toLowerCase();
-  return value !== "0" && value !== "false" && value !== "no";
+  const value = String(process.env.DEBUG_TRACE_IN_RESPONSE || "false").toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
 }
 
 function compactJson(value) {
