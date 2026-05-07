@@ -139,7 +139,7 @@ function requestPolicy(message) {
       normalized.includes("two campaign"))
   ) {
     rules.push(
-      "For products appearing/running in multiple campaigns, use count_products_in_multiple_campaigns.",
+      "For products appearing/running in multiple campaigns, use count_products_in_multiple_campaigns; it scans all available Shopping and Performance Max campaigns by default.",
       "If an API field requires an equality filter, decompose the task into multiple valid scoped queries and compare/count results in code.",
       "Do not refuse just because the comparison cannot be expressed in one GAQL query.",
       "If count_products_in_multiple_campaigns returns is_partial=true, answer with the partial count and clearly say how many campaigns were scanned versus available."

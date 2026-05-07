@@ -603,9 +603,9 @@ def count_products_in_multiple_campaigns(
     campaign_status: str = "ENABLED",
     product_status_group: str = "enabled",
     sample_size: int = 10,
-    max_campaigns: int = 250,
+    max_campaigns: int = 0,
     max_concurrency: int = 5,
-    time_budget_seconds: int = 50,
+    time_budget_seconds: int = 90,
 ) -> Dict[str, Any]:
     """Counts shopping products included in at least N different campaigns.
 
@@ -622,8 +622,8 @@ def count_products_in_multiple_campaigns(
         product_status_group: Product status group, usually enabled for
             ELIGIBLE + ELIGIBLE_LIMITED products
         sample_size: Number of matching product samples to return
-        max_campaigns: Maximum campaign-scoped product queries to run before
-            returning partial results
+        max_campaigns: Optional positive campaign scan cap. Leave as 0 to scan
+            every available Shopping and Performance Max campaign.
         max_concurrency: Maximum campaign product queries to run at once
         time_budget_seconds: Stop launching new work near this budget and
             return partial results instead of timing out
@@ -632,9 +632,9 @@ def count_products_in_multiple_campaigns(
     started_at = time.monotonic()
     final_min_campaign_count = max(2, int(min_campaign_count or 2))
     final_sample_size = max(0, min(int(sample_size or 10), 25))
-    final_max_campaigns = max(1, min(int(max_campaigns or 250), 500))
+    final_max_campaigns = max(0, int(max_campaigns or 0))
     final_max_concurrency = max(1, min(int(max_concurrency or 5), 10))
-    final_time_budget_seconds = max(10, min(int(time_budget_seconds or 50), 120))
+    final_time_budget_seconds = max(10, min(int(time_budget_seconds or 90), 180))
     cache_key = (
         customer_id,
         final_min_campaign_count,
@@ -677,7 +677,9 @@ def count_products_in_multiple_campaigns(
     processed_campaigns = 0
     timed_out_before_full_scan = False
 
-    campaigns_to_scan = campaigns[:final_max_campaigns]
+    campaigns_to_scan = (
+        campaigns[:final_max_campaigns] if final_max_campaigns > 0 else campaigns
+    )
 
     def fetch_campaign_products(campaign: Dict[str, Any]) -> Dict[str, Any]:
         campaign_id = _row_value(campaign, "campaign.id")
@@ -780,8 +782,7 @@ def count_products_in_multiple_campaigns(
     matching_products.sort(key=lambda item: item["campaign_count"], reverse=True)
 
     is_partial = (
-        len(campaigns) > len(campaigns_to_scan)
-        or len(campaigns_to_scan) > processed_campaigns + len(skipped_campaigns)
+        len(campaigns_to_scan) > processed_campaigns + len(skipped_campaigns)
         or timed_out_before_full_scan
     )
     result = {
@@ -791,7 +792,12 @@ def count_products_in_multiple_campaigns(
         "product_status_group": product_status_group,
         "campaigns_scanned": processed_campaigns,
         "campaigns_available": len(campaigns),
-        "max_campaigns": final_max_campaigns,
+        "max_campaigns": final_max_campaigns or None,
+        "campaign_scan_scope": (
+            "all_available_campaigns"
+            if final_max_campaigns == 0
+            else "explicit_max_campaigns"
+        ),
         "max_concurrency": final_max_concurrency,
         "time_budget_seconds": final_time_budget_seconds,
         "elapsed_seconds": round(time.monotonic() - started_at, 2),
@@ -799,8 +805,6 @@ def count_products_in_multiple_campaigns(
         "partial_reason": (
             "time_budget_exceeded"
             if timed_out_before_full_scan
-            else "max_campaigns_below_available"
-            if len(campaigns) > len(campaigns_to_scan)
             else "some_campaigns_failed_or_unprocessed"
             if is_partial
             else None
@@ -815,9 +819,9 @@ def count_products_in_multiple_campaigns(
             "tool decomposes the task into one valid campaign-scope query per "
             "campaign and compares product item IDs server-side. To avoid MCP "
             "timeouts, it scans Shopping and Performance Max campaigns in "
-            "parallel batches, caches repeated requests briefly, and returns "
-            "partial results if the requested scope exceeds max_campaigns or "
-            "the time budget."
+            "parallel batches, scans all available campaigns by default, caches "
+            "repeated requests briefly, and returns partial results only if the "
+            "time budget is reached or individual campaign queries fail."
         ),
     }
     _cache_set(
