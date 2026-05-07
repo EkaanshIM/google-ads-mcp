@@ -15,9 +15,11 @@
 """Tools for exposing the API Search method to the MCP server."""
 
 from datetime import datetime, timedelta
+from collections.abc import Iterable
 from typing import Any, Dict, List
 from ads_mcp.coordinator import mcp
 import ads_mcp.utils as utils
+import proto
 
 
 _METRIC_ALIASES = {
@@ -54,6 +56,33 @@ def _row_float(row: Dict[str, Any], field: str, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _plain_value(value: Any) -> Any:
+    if isinstance(value, proto.Enum):
+        return value.name
+    if isinstance(value, proto.Message):
+        return proto.Message.to_dict(value, preserving_proto_field_name=True)
+    if isinstance(value, dict):
+        return {key: _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _value_contains(value: Any, needle: str) -> bool:
+    normalized_needle = (needle or "").strip().lower()
+    if not normalized_needle:
+        return False
+
+    plain = _plain_value(value)
+    if isinstance(plain, dict):
+        return any(_value_contains(item, normalized_needle) for item in plain.values())
+    if isinstance(plain, list):
+        return any(_value_contains(item, normalized_needle) for item in plain)
+    return normalized_needle in str(plain).lower()
 
 
 def _date(value: str) -> datetime:
@@ -528,6 +557,90 @@ def count_products_by_status(
         "note": (
             "enabled/unpaused/servable maps to ELIGIBLE + ELIGIBLE_LIMITED; "
             "paused/not servable maps to NOT_ELIGIBLE."
+        ),
+    }
+
+
+@mcp.tool()
+def count_products_by_issue(
+    customer_id: str,
+    issue_text: str,
+    status_group: str = "all",
+    sample_size: int = 10,
+) -> Dict[str, Any]:
+    """Counts shopping products whose fetched issue details contain text.
+
+    Use this when the user asks how many products have a specific Merchant
+    Center / shopping product issue. `shopping_product.issues` is selectable
+    but may not be filterable, so this tool fetches the issue field and counts
+    matching rows server-side instead of refusing.
+
+    Args:
+        customer_id: The id of the customer
+        issue_text: Text to match inside shopping_product.issues, e.g.
+            "product page unavailable"
+        status_group: Optional status group to prefilter products. Use all,
+            eligible, limited, enabled, or not_eligible.
+        sample_size: Number of matching product samples to return
+    """
+
+    final_sample_size = max(0, min(int(sample_size or 10), 25))
+    conditions = _product_status_conditions(status_group)
+    fields = [
+        "shopping_product.resource_name",
+        "shopping_product.item_id",
+        "shopping_product.status",
+        "shopping_product.issues",
+    ]
+
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+    query_parts = [f"SELECT {','.join(fields)} FROM shopping_product"]
+    if conditions:
+        query_parts.append(f" WHERE {' AND '.join(conditions)}")
+    query_parts.append(" PARAMETERS omit_unselected_resource_names=true")
+    query = "".join(query_parts)
+    utils.logger.info(f"ads_mcp.count_products_by_issue query {query}")
+
+    query_result = ga_service.search_stream(customer_id=customer_id, query=query)
+
+    scanned_count = 0
+    matched_count = 0
+    samples = []
+    issue_field = "shopping_product.issues"
+    for batch in query_result:
+        for row in batch.results:
+            scanned_count += 1
+            issues = utils.get_nested_attr(row, issue_field)
+            if not _value_contains(issues, issue_text):
+                continue
+
+            matched_count += 1
+            if len(samples) < final_sample_size:
+                samples.append(
+                    {
+                        "resource_name": utils.format_output_value(
+                            utils.get_nested_attr(row, "shopping_product.resource_name")
+                        ),
+                        "item_id": utils.format_output_value(
+                            utils.get_nested_attr(row, "shopping_product.item_id")
+                        ),
+                        "status": utils.format_output_value(
+                            utils.get_nested_attr(row, "shopping_product.status")
+                        ),
+                    }
+                )
+
+    return {
+        "customer_id": customer_id,
+        "issue_text": issue_text,
+        "status_group": status_group,
+        "query": query,
+        "scanned_product_count": scanned_count,
+        "matched_product_count": matched_count,
+        "samples": samples,
+        "note": (
+            "shopping_product.issues was matched after fetching because the "
+            "field may be selectable but not filterable in GAQL."
         ),
     }
 
