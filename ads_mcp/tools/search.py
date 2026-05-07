@@ -568,6 +568,7 @@ def count_products_in_multiple_campaigns(
     campaign_status: str = "ENABLED",
     product_status_group: str = "enabled",
     sample_size: int = 10,
+    max_campaigns: int = 25,
 ) -> Dict[str, Any]:
     """Counts shopping products included in at least N different campaigns.
 
@@ -584,16 +585,27 @@ def count_products_in_multiple_campaigns(
         product_status_group: Product status group, usually enabled for
             ELIGIBLE + ELIGIBLE_LIMITED products
         sample_size: Number of matching product samples to return
+        max_campaigns: Maximum campaign-scoped product queries to run before
+            returning partial results
     """
 
     final_min_campaign_count = max(2, int(min_campaign_count or 2))
     final_sample_size = max(0, min(int(sample_size or 10), 25))
+    final_max_campaigns = max(1, min(int(max_campaigns or 25), 100))
     campaign_conditions = _status_condition("campaign", campaign_status)
+    campaign_conditions.append(
+        "campaign.advertising_channel_type IN ('SHOPPING', 'PERFORMANCE_MAX')"
+    )
     product_status_conditions = _product_status_conditions(product_status_group)
 
     campaigns = search(
         customer_id=customer_id,
-        fields=["campaign.id", "campaign.name", "campaign.status"],
+        fields=[
+            "campaign.id",
+            "campaign.name",
+            "campaign.status",
+            "campaign.advertising_channel_type",
+        ],
         resource="campaign",
         conditions=campaign_conditions,
         limit=10000,
@@ -602,13 +614,15 @@ def count_products_in_multiple_campaigns(
     product_campaigns: Dict[str, Dict[str, Any]] = {}
     product_campaign_pair_count = 0
     skipped_campaigns = []
+    processed_campaigns = 0
 
-    for campaign in campaigns:
+    for campaign in campaigns[:final_max_campaigns]:
         campaign_id = _row_value(campaign, "campaign.id")
         campaign_name = _row_value(campaign, "campaign.name")
         if not campaign_id:
             continue
 
+        processed_campaigns += 1
         campaign_resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
         conditions = [
             f"shopping_product.campaign = '{campaign_resource_name}'",
@@ -679,7 +693,10 @@ def count_products_in_multiple_campaigns(
         "min_campaign_count": final_min_campaign_count,
         "campaign_status": campaign_status,
         "product_status_group": product_status_group,
-        "campaigns_scanned": len(campaigns),
+        "campaigns_scanned": processed_campaigns,
+        "campaigns_available": len(campaigns),
+        "max_campaigns": final_max_campaigns,
+        "is_partial": len(campaigns) > processed_campaigns,
         "campaigns_skipped": skipped_campaigns,
         "unique_products_scanned": len(product_campaigns),
         "product_campaign_pair_count": product_campaign_pair_count,
@@ -688,7 +705,10 @@ def count_products_in_multiple_campaigns(
         "note": (
             "shopping_product.campaign requires an equality filter, so this "
             "tool decomposes the task into one valid campaign-scope query per "
-            "campaign and compares product item IDs server-side."
+            "campaign and compares product item IDs server-side. To avoid MCP "
+            "timeouts, it scans Shopping and Performance Max campaigns first "
+            "and returns partial results when max_campaigns is lower than the "
+            "available campaign count."
         ),
     }
 
