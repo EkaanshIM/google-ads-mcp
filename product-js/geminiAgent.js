@@ -1,4 +1,5 @@
 import { FunctionCallingConfigMode, GoogleGenAI, mcpToTool } from "@google/genai";
+import { logDebugEvent, summarizeMcpResult } from "./debugLogger.js";
 import { getMcpClient } from "./mcp.js";
 
 function requireEnv(name) {
@@ -147,7 +148,50 @@ function extractText(res) {
   return texts.join("\n");
 }
 
-export async function runGeminiWithMcp({ message, customerId }) {
+function instrumentMcpClient(mcpClient, context) {
+  const callTool = async (request, options) => {
+    const startedAt = new Date().toISOString();
+    await logDebugEvent("gemini.mcp_tool_call", {
+      ...context,
+      startedAt,
+      toolName: request?.name,
+      toolArguments: request?.arguments || {}
+    });
+
+    try {
+      const result = await mcpClient.callTool.call(mcpClient, request, options);
+      await logDebugEvent("gemini.mcp_tool_result", {
+        ...context,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        toolName: request?.name,
+        toolArguments: request?.arguments || {},
+        result: summarizeMcpResult(result)
+      });
+      return result;
+    } catch (error) {
+      await logDebugEvent("gemini.mcp_tool_error", {
+        ...context,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        toolName: request?.name,
+        toolArguments: request?.arguments || {},
+        error: error?.message ?? String(error)
+      });
+      throw error;
+    }
+  };
+
+  return new Proxy(mcpClient, {
+    get(target, prop, receiver) {
+      if (prop === "callTool") return callTool;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+}
+
+export async function runGeminiWithMcp({ message, customerId, jobId }) {
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
@@ -193,11 +237,22 @@ export async function runGeminiWithMcp({ message, customerId }) {
     : `Critical query policy for this request:\n${requestPolicy(message)}\n\nUser request:\n${message}`;
 
   const prompt = `${systemPrefix}\n\n${userText}`;
+  const context = {
+    jobId: jobId || null,
+    customerId: effectiveCustomerId || null,
+    userMessage: message
+  };
+
+  await logDebugEvent("gemini.prompt_prepared", {
+    ...context,
+    model: modelName(),
+    prompt
+  });
 
   // Use the SDK's experimental built-in MCP adapter. This lets the SDK handle
   // function calling + tool execution automatically.
   const mcpClient = await getMcpClient();
-  const tools = [mcpToTool(mcpClient)];
+  const tools = [mcpToTool(instrumentMcpClient(mcpClient, context))];
   const config = geminiConfig(tools);
 
   const res1 = await ai.models.generateContent({

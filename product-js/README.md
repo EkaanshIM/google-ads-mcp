@@ -57,3 +57,7 @@ Open:
 - This Node server uses the Gemini API directly. It does not depend on Gemini
   CLI approval settings in production; all MCP tools supplied by the backend are
   available to Gemini automatically through the SDK.
+- Debug events are written as JSONL to `data/debug-events.jsonl` by default.
+  They include frontend chat requests, prepared Gemini prompts, Gemini MCP tool
+  calls, tool arguments, compact tool result summaries, and job outcomes. Set
+  `DEBUG_LOG_FILE` to override the path.

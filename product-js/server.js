@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { logDebugEvent, summarizeMcpResult, debugLogFile } from "./debugLogger.js";
 import { runGeminiWithMcp } from "./geminiAgent.js";
 import { getMcpClient } from "./mcp.js";
 
@@ -40,6 +41,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "static")));
 
 app.get("/api/healthz", (req, res) => res.json({ status: "ok" }));
+app.get("/api/debug/log-path", (req, res) => res.json({ path: debugLogFile }));
 app.get("/api/chat/:jobId", async (req, res) => {
   try {
     const job = await readJob(req.params.jobId);
@@ -73,7 +75,18 @@ app.post("/api/mcp/call", async (req, res) => {
     if (!name) return res.status(400).json({ error: "name is required" });
 
     const mcp = await getMcpClient();
+    await logDebugEvent("api.mcp_call_received", {
+      toolName: name,
+      toolArguments: args,
+      route: "/api/mcp/call"
+    });
     const out = await mcp.callTool({ name, arguments: args });
+    await logDebugEvent("api.mcp_call_result", {
+      toolName: name,
+      toolArguments: args,
+      route: "/api/mcp/call",
+      result: summarizeMcpResult(out)
+    });
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e?.message ?? String(e) });
@@ -97,6 +110,15 @@ app.post("/api/chat", async (req, res) => {
   };
 
   try {
+    await logDebugEvent("frontend.chat_request_received", {
+      jobId,
+      message,
+      requestedCustomerId,
+      resolvedCustomerId: customerId,
+      route: "/api/chat",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"] || ""
+    });
     await writeJob(job);
     const jobPromise = queueChatJob(job).catch((e) => {
       console.error(`Job ${jobId} failed`, e);
@@ -159,7 +181,7 @@ function isPausedLast24HoursQuestion(message) {
   );
 }
 
-async function runPausedCampaignFastPath(customerId) {
+async function runPausedCampaignFastPath(customerId, context = {}) {
   const cid = resolvedCustomerId(customerId);
   if (!cid) {
     throw new Error("A customer id is required for this account query. Pass customerId or set DEFAULT_CUSTOMER_ID.");
@@ -167,7 +189,7 @@ async function runPausedCampaignFastPath(customerId) {
 
   const mcp = await getMcpClient();
 
-  const toolOut = await mcp.callTool({
+  const toolRequest = {
     name: "search",
     arguments: {
       customer_id: cid,
@@ -188,6 +210,22 @@ async function runPausedCampaignFastPath(customerId) {
       orderings: ["change_event.change_date_time DESC"],
       limit: 2000
     }
+  };
+
+  await logDebugEvent("server.fast_path_mcp_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments
+  });
+  const toolOut = await mcp.callTool({
+    name: toolRequest.name,
+    arguments: toolRequest.arguments
+  });
+  await logDebugEvent("server.fast_path_mcp_result", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    result: summarizeMcpResult(toolOut)
   });
 
   const rows = Array.isArray(toolOut?.content) ? toolOut.content : toolOut;
@@ -229,13 +267,20 @@ async function runPausedCampaignFastPath(customerId) {
 }
 
 async function runChatJob(job) {
+  const context = {
+    jobId: job.id,
+    customerId: job.customerId,
+    userMessage: job.message
+  };
+
   if (isPausedLast24HoursQuestion(job.message)) {
-    return runPausedCampaignFastPath(job.customerId);
+    return runPausedCampaignFastPath(job.customerId, context);
   }
 
   const out = await runGeminiWithMcp({
     message: job.message,
-    customerId: job.customerId
+    customerId: job.customerId,
+    jobId: job.id
   });
   return {
     ...out,
@@ -253,10 +298,21 @@ async function queueChatJob(job) {
       completedAt: new Date().toISOString(),
       result
     });
+    await logDebugEvent("chat_job.completed", {
+      jobId: job.id,
+      customerId: job.customerId,
+      mode: result?.mode || null,
+      textPreview: String(result?.text || "").slice(0, 4000)
+    });
   } catch (e) {
     await updateJob(job.id, {
       status: "failed",
       completedAt: new Date().toISOString(),
+      error: publicErrorMessage(e)
+    });
+    await logDebugEvent("chat_job.failed", {
+      jobId: job.id,
+      customerId: job.customerId,
       error: publicErrorMessage(e)
     });
   } finally {

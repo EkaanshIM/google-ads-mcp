@@ -8,6 +8,7 @@
 .env.*
 !.env.example
 product-js/data/chat-jobs/
+product-js/data/*.jsonl
 
 # Distribution / packaging
 .Python
