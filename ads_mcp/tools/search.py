@@ -604,8 +604,8 @@ def count_products_in_multiple_campaigns(
     product_status_group: str = "enabled",
     sample_size: int = 10,
     max_campaigns: int = 0,
-    max_concurrency: int = 5,
-    time_budget_seconds: int = 90,
+    max_concurrency: int = 8,
+    time_budget_seconds: int = 0,
 ) -> Dict[str, Any]:
     """Counts shopping products included in at least N different campaigns.
 
@@ -625,16 +625,16 @@ def count_products_in_multiple_campaigns(
         max_campaigns: Optional positive campaign scan cap. Leave as 0 to scan
             every available Shopping and Performance Max campaign.
         max_concurrency: Maximum campaign product queries to run at once
-        time_budget_seconds: Stop launching new work near this budget and
-            return partial results instead of timing out
+        time_budget_seconds: Optional safety budget. Leave as 0 for a full scan;
+            pass a positive value to return partial results after that budget.
     """
 
     started_at = time.monotonic()
     final_min_campaign_count = max(2, int(min_campaign_count or 2))
     final_sample_size = max(0, min(int(sample_size or 10), 25))
     final_max_campaigns = max(0, int(max_campaigns or 0))
-    final_max_concurrency = max(1, min(int(max_concurrency or 5), 10))
-    final_time_budget_seconds = max(10, min(int(time_budget_seconds or 90), 180))
+    final_max_concurrency = max(1, min(int(max_concurrency or 8), 12))
+    final_time_budget_seconds = max(0, int(time_budget_seconds or 0))
     cache_key = (
         customer_id,
         final_min_campaign_count,
@@ -643,6 +643,7 @@ def count_products_in_multiple_campaigns(
         final_sample_size,
         final_max_campaigns,
         final_max_concurrency,
+        final_time_budget_seconds,
     )
     cached = _cache_get(
         _PRODUCT_CAMPAIGN_OVERLAP_CACHE,
@@ -722,7 +723,10 @@ def count_products_in_multiple_campaigns(
         next_index = 0
         while next_index < len(campaigns_to_scan):
             elapsed = time.monotonic() - started_at
-            if elapsed >= final_time_budget_seconds:
+            if (
+                final_time_budget_seconds > 0
+                and elapsed >= final_time_budget_seconds
+            ):
                 timed_out_before_full_scan = True
                 break
 
@@ -799,7 +803,9 @@ def count_products_in_multiple_campaigns(
             else "explicit_max_campaigns"
         ),
         "max_concurrency": final_max_concurrency,
-        "time_budget_seconds": final_time_budget_seconds,
+        "time_budget_seconds": (
+            final_time_budget_seconds if final_time_budget_seconds > 0 else None
+        ),
         "elapsed_seconds": round(time.monotonic() - started_at, 2),
         "is_partial": is_partial,
         "partial_reason": (
@@ -820,17 +826,19 @@ def count_products_in_multiple_campaigns(
             "campaign and compares product item IDs server-side. To avoid MCP "
             "timeouts, it scans Shopping and Performance Max campaigns in "
             "parallel batches, scans all available campaigns by default, caches "
-            "repeated requests briefly, and returns partial results only if the "
-            "time budget is reached or individual campaign queries fail."
+            "complete repeated requests briefly, and returns partial results only "
+            "if an explicit time budget is reached or individual campaign queries "
+            "fail."
         ),
     }
-    _cache_set(
-        _PRODUCT_CAMPAIGN_OVERLAP_CACHE,
-        _PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK,
-        cache_key,
-        result,
-        _PRODUCT_CAMPAIGN_OVERLAP_CACHE_TTL_SECONDS,
-    )
+    if not is_partial:
+        _cache_set(
+            _PRODUCT_CAMPAIGN_OVERLAP_CACHE,
+            _PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK,
+            cache_key,
+            result,
+            _PRODUCT_CAMPAIGN_OVERLAP_CACHE_TTL_SECONDS,
+        )
     return result
 
 

@@ -181,6 +181,104 @@ function isPausedLast24HoursQuestion(message) {
   );
 }
 
+function isProductMultipleCampaignCountQuestion(message) {
+  const normalized = message.toLowerCase();
+  const mentionsProduct =
+    normalized.includes("product") ||
+    normalized.includes("products") ||
+    normalized.includes("prod") ||
+    normalized.includes("item");
+  const mentionsCampaign = normalized.includes("campaign");
+  const asksForCount =
+    normalized.includes("count") ||
+    normalized.includes("how many") ||
+    normalized.includes("number");
+  const mentionsOverlap =
+    normalized.includes("different") ||
+    normalized.includes("multiple") ||
+    normalized.includes("more than") ||
+    normalized.includes("at least") ||
+    normalized.includes("2 campaign") ||
+    normalized.includes("two campaign");
+  return mentionsProduct && mentionsCampaign && asksForCount && mentionsOverlap;
+}
+
+function parseMcpToolResult(toolOut) {
+  if (Array.isArray(toolOut?.content)) {
+    for (const item of toolOut.content) {
+      if (item?.type !== "text" || typeof item.text !== "string") continue;
+      try {
+        return JSON.parse(item.text);
+      } catch {
+        return item.text;
+      }
+    }
+  }
+  return toolOut;
+}
+
+async function runProductMultipleCampaignFastPath(customerId, context = {}) {
+  const cid = resolvedCustomerId(customerId);
+  const mcp = await getMcpClient();
+  const toolRequest = {
+    name: "count_products_in_multiple_campaigns",
+    arguments: {
+      customer_id: cid,
+      min_campaign_count: 2,
+      campaign_status: "ENABLED",
+      product_status_group: "enabled",
+      sample_size: 10,
+      max_campaigns: 0,
+      max_concurrency: 10,
+      time_budget_seconds: 0
+    }
+  };
+
+  await logDebugEvent("server.fast_path_mcp_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments
+  });
+  const toolOut = await mcp.callTool({
+    name: toolRequest.name,
+    arguments: toolRequest.arguments
+  });
+  const result = parseMcpToolResult(toolOut);
+  await logDebugEvent("server.fast_path_mcp_result", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    result: summarizeMcpResult(result)
+  });
+
+  if (!result || typeof result !== "object") {
+    return {
+      text: typeof result === "string" ? result : "The product campaign overlap count completed, but the result format was not recognized.",
+      customerIdUsed: cid,
+      mode: "fast-path",
+      raw: result
+    };
+  }
+
+  const count = Number(result.matching_product_count ?? 0);
+  const scanned = Number(result.campaigns_scanned ?? 0);
+  const available = Number(result.campaigns_available ?? 0);
+  const elapsed = result.elapsed_seconds;
+  const partialNote = result.is_partial
+    ? `\n\nNote: This is still partial because ${result.partial_reason || "some campaign queries did not complete"}. It scanned ${scanned} out of ${available} available campaigns.`
+    : "";
+  const skippedNote = Array.isArray(result.campaigns_skipped) && result.campaigns_skipped.length
+    ? ` ${result.campaigns_skipped.length} campaign(s) were skipped due to API errors.`
+    : "";
+
+  return {
+    text: `For customer ID ${cid}, there are ${count} products running in 2 or more different enabled campaigns.\n\nCampaign scan: ${scanned} of ${available} available Shopping/Performance Max campaigns.${elapsed != null ? ` Completed in ${elapsed} seconds.` : ""}${skippedNote}${partialNote}`,
+    customerIdUsed: cid,
+    mode: "fast-path",
+    result
+  };
+}
+
 async function runPausedCampaignFastPath(customerId, context = {}) {
   const cid = resolvedCustomerId(customerId);
   if (!cid) {
@@ -275,6 +373,10 @@ async function runChatJob(job) {
 
   if (isPausedLast24HoursQuestion(job.message)) {
     return runPausedCampaignFastPath(job.customerId, context);
+  }
+
+  if (isProductMultipleCampaignCountQuestion(job.message)) {
+    return runProductMultipleCampaignFastPath(job.customerId, context);
   }
 
   const out = await runGeminiWithMcp({
