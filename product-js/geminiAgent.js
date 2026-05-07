@@ -170,11 +170,64 @@ function extractText(res) {
   return texts.join("\n");
 }
 
+function includeTraceInResponse() {
+  const value = String(process.env.DEBUG_TRACE_IN_RESPONSE || "true").toLowerCase();
+  return value !== "0" && value !== "false" && value !== "no";
+}
+
+function compactJson(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function formatExecutionTrace({ customerId, understanding, toolCalls }) {
+  const lines = [
+    "",
+    "",
+    "---",
+    "Execution trace",
+    "",
+    "What I understood / applied:",
+    understanding || "- No special request policy."
+  ];
+
+  if (!toolCalls.length) {
+    lines.push("", "MCP tools used:", "- None");
+    return lines.join("\n");
+  }
+
+  lines.push("", "MCP tools used:");
+  toolCalls.forEach((call, index) => {
+    lines.push(
+      "",
+      `${index + 1}. ${call.toolName}`,
+      `Customer ID: ${customerId || "not provided"}`,
+      "Arguments:",
+      compactJson(call.toolArguments || {})
+    );
+    if (call.result) {
+      lines.push("Result summary:", compactJson(call.result));
+    }
+    if (call.error) {
+      lines.push(`Error: ${call.error}`);
+    }
+  });
+
+  return lines.join("\n");
+}
+
 function instrumentMcpClient(mcpClient, context) {
   const callTool = async (request, options) => {
     const startedAt = new Date().toISOString();
+    const { toolCalls: trace, ...logContext } = context;
+    const traceEntry = {
+      startedAt,
+      toolName: request?.name,
+      toolArguments: request?.arguments || {}
+    };
+    trace?.push(traceEntry);
+
     await logDebugEvent("gemini.mcp_tool_call", {
-      ...context,
+      ...logContext,
       startedAt,
       toolName: request?.name,
       toolArguments: request?.arguments || {}
@@ -182,23 +235,27 @@ function instrumentMcpClient(mcpClient, context) {
 
     try {
       const result = await mcpClient.callTool.call(mcpClient, request, options);
+      traceEntry.completedAt = new Date().toISOString();
+      traceEntry.result = summarizeMcpResult(result);
       await logDebugEvent("gemini.mcp_tool_result", {
-        ...context,
+        ...logContext,
         startedAt,
-        completedAt: new Date().toISOString(),
+        completedAt: traceEntry.completedAt,
         toolName: request?.name,
         toolArguments: request?.arguments || {},
-        result: summarizeMcpResult(result)
+        result: traceEntry.result
       });
       return result;
     } catch (error) {
+      traceEntry.completedAt = new Date().toISOString();
+      traceEntry.error = error?.message ?? String(error);
       await logDebugEvent("gemini.mcp_tool_error", {
-        ...context,
+        ...logContext,
         startedAt,
-        completedAt: new Date().toISOString(),
+        completedAt: traceEntry.completedAt,
         toolName: request?.name,
         toolArguments: request?.arguments || {},
-        error: error?.message ?? String(error)
+        error: traceEntry.error
       });
       throw error;
     }
@@ -256,19 +313,23 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
+  const understanding = requestPolicy(message);
   const userText = effectiveCustomerId
-    ? `Customer ID: ${effectiveCustomerId}\n\nCritical query policy for this request:\n${requestPolicy(message)}\n\nUser request:\n${message}`
-    : `Critical query policy for this request:\n${requestPolicy(message)}\n\nUser request:\n${message}`;
+    ? `Customer ID: ${effectiveCustomerId}\n\nCritical query policy for this request:\n${understanding}\n\nUser request:\n${message}`
+    : `Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`;
 
   const prompt = `${systemPrefix}\n\n${userText}`;
+  const toolCalls = [];
   const context = {
     jobId: jobId || null,
     customerId: effectiveCustomerId || null,
-    userMessage: message
+    userMessage: message,
+    toolCalls
   };
+  const { toolCalls: _toolCalls, ...logContext } = context;
 
   await logDebugEvent("gemini.prompt_prepared", {
-    ...context,
+    ...logContext,
     model: modelName(),
     prompt
   });
@@ -298,5 +359,14 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     text = extractText(res2);
   }
 
-  return { text };
+  const debugTrace = {
+    customerId: effectiveCustomerId || null,
+    understanding,
+    toolCalls
+  };
+  const finalText = includeTraceInResponse()
+    ? `${text || ""}${formatExecutionTrace(debugTrace)}`
+    : text;
+
+  return { text: finalText, debugTrace };
 }

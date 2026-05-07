@@ -61,3 +61,6 @@ Open:
   They include frontend chat requests, prepared Gemini prompts, Gemini MCP tool
   calls, tool arguments, compact tool result summaries, and job outcomes. Set
   `DEBUG_LOG_FILE` to override the path.
+- `DEBUG_TRACE_IN_RESPONSE=true` shows a compact execution trace in each
+  frontend answer: interpreted request policy, selected MCP tools, arguments,
+  and result summaries.
