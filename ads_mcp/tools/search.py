@@ -562,6 +562,138 @@ def count_products_by_status(
 
 
 @mcp.tool()
+def count_products_in_multiple_campaigns(
+    customer_id: str,
+    min_campaign_count: int = 2,
+    campaign_status: str = "ENABLED",
+    product_status_group: str = "enabled",
+    sample_size: int = 10,
+) -> Dict[str, Any]:
+    """Counts shopping products included in at least N different campaigns.
+
+    Use this when the user asks for products running/showing/appearing in
+    multiple campaigns. `shopping_product.campaign` requires campaign scope,
+    so this tool first fetches campaigns, then queries shopping products once
+    per campaign using the required equality filter and compares item IDs in
+    code.
+
+    Args:
+        customer_id: The id of the customer
+        min_campaign_count: Minimum number of distinct campaigns per product
+        campaign_status: Campaign status filter, usually ENABLED; use ALL for no filter
+        product_status_group: Product status group, usually enabled for
+            ELIGIBLE + ELIGIBLE_LIMITED products
+        sample_size: Number of matching product samples to return
+    """
+
+    final_min_campaign_count = max(2, int(min_campaign_count or 2))
+    final_sample_size = max(0, min(int(sample_size or 10), 25))
+    campaign_conditions = _status_condition("campaign", campaign_status)
+    product_status_conditions = _product_status_conditions(product_status_group)
+
+    campaigns = search(
+        customer_id=customer_id,
+        fields=["campaign.id", "campaign.name", "campaign.status"],
+        resource="campaign",
+        conditions=campaign_conditions,
+        limit=10000,
+    )
+
+    product_campaigns: Dict[str, Dict[str, Any]] = {}
+    product_campaign_pair_count = 0
+    skipped_campaigns = []
+
+    for campaign in campaigns:
+        campaign_id = _row_value(campaign, "campaign.id")
+        campaign_name = _row_value(campaign, "campaign.name")
+        if not campaign_id:
+            continue
+
+        campaign_resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
+        conditions = [
+            f"shopping_product.campaign = '{campaign_resource_name}'",
+            *product_status_conditions,
+        ]
+
+        try:
+            rows = search(
+                customer_id=customer_id,
+                fields=[
+                    "shopping_product.item_id",
+                    "shopping_product.resource_name",
+                    "shopping_product.status",
+                    "shopping_product.campaign",
+                ],
+                resource="shopping_product",
+                conditions=conditions,
+                limit=100000,
+            )
+        except Exception as error:
+            skipped_campaigns.append(
+                {
+                    "campaign_id": campaign_id,
+                    "campaign_name": campaign_name,
+                    "error": str(error),
+                }
+            )
+            continue
+
+        for row in rows:
+            product_key = str(
+                _row_value(row, "shopping_product.item_id")
+                or _row_value(row, "shopping_product.resource_name")
+            )
+            if not product_key:
+                continue
+
+            product_campaign_pair_count += 1
+            entry = product_campaigns.setdefault(
+                product_key,
+                {
+                    "item_id": _row_value(row, "shopping_product.item_id"),
+                    "resource_name": _row_value(row, "shopping_product.resource_name"),
+                    "status": _row_value(row, "shopping_product.status"),
+                    "campaigns": {},
+                },
+            )
+            entry["campaigns"][str(campaign_id)] = {
+                "campaign_id": campaign_id,
+                "campaign_name": campaign_name,
+            }
+
+    matching_products = [
+        {
+            "item_id": item["item_id"],
+            "resource_name": item["resource_name"],
+            "status": item["status"],
+            "campaign_count": len(item["campaigns"]),
+            "campaigns": list(item["campaigns"].values()),
+        }
+        for item in product_campaigns.values()
+        if len(item["campaigns"]) >= final_min_campaign_count
+    ]
+    matching_products.sort(key=lambda item: item["campaign_count"], reverse=True)
+
+    return {
+        "customer_id": customer_id,
+        "min_campaign_count": final_min_campaign_count,
+        "campaign_status": campaign_status,
+        "product_status_group": product_status_group,
+        "campaigns_scanned": len(campaigns),
+        "campaigns_skipped": skipped_campaigns,
+        "unique_products_scanned": len(product_campaigns),
+        "product_campaign_pair_count": product_campaign_pair_count,
+        "matching_product_count": len(matching_products),
+        "samples": matching_products[:final_sample_size],
+        "note": (
+            "shopping_product.campaign requires an equality filter, so this "
+            "tool decomposes the task into one valid campaign-scope query per "
+            "campaign and compares product item IDs server-side."
+        ),
+    }
+
+
+@mcp.tool()
 def count_products_by_issue(
     customer_id: str,
     issue_text: str,
