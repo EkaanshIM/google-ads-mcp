@@ -162,6 +162,10 @@ def _search_tool_description() -> str:
 
 ### Hints for limits
     Requests to resource change_event must specify a LIMIT of less than or equal to 10000
+    For ranking, top/bottom, best/worst, or performance questions, do not use an unordered limited sample.
+    Use ORDER BY on the ranking metric when asking for top-N by a specific metric.
+    If the ranking requires multiple metrics or custom scoring, fetch the full candidate set with a large enough LIMIT and rank after fetching.
+    For campaign performance ranking, add campaign.status = 'ENABLED' unless the user explicitly asks for all statuses.
 
 ### Hints for conversions questions
     https://developers.google.com/google-ads/api/docs/conversions/upload-summaries 

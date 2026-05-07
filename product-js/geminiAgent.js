@@ -134,6 +134,26 @@ function requestPolicy(message) {
     );
   }
 
+  if (
+    normalized.includes("campaign") &&
+    (normalized.includes("best") ||
+      normalized.includes("worst") ||
+      normalized.includes("top") ||
+      normalized.includes("bottom") ||
+      normalized.includes("highest") ||
+      normalized.includes("lowest") ||
+      normalized.includes("performing") ||
+      normalized.includes("performance"))
+  ) {
+    rules.push(
+      "For campaign best/worst/top/bottom performance questions, do not use an unordered limited sample. Add campaign.status = 'ENABLED' unless the user asks for all campaign statuses.",
+      "Fetch enough rows to rank the full candidate set; use limit 1000 or higher for campaign-level ranking unless a smaller top-N is explicitly paired with ORDER BY on the ranking metric.",
+      "Include supporting fields: campaign.id, campaign.name, metrics.clicks, metrics.impressions, metrics.ctr, metrics.average_cpc, metrics.cost_micros, metrics.conversions, and customer.currency_code when available.",
+      "If the user does not specify a ranking metric, rank best by a balanced performance view using conversions, cost efficiency, clicks, CTR, and CPC; state the primary metric/scoring rule used.",
+      "Never conclude all campaigns have zero activity from a limited or unordered campaign sample. If campaign rows appear all zero, run a customer-level sanity query for the same date with clicks, impressions, cost, and conversions before answering."
+    );
+  }
+
   return rules.map((rule) => `- ${rule}`).join("\n");
 }
 
@@ -219,6 +239,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For conversions, use metrics.conversions unless the user asks for a more specific conversion metric. " +
     "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, and customer.currency_code when money is shown. Convert average_cpc and cost_micros from micros to currency units. " +
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
+    "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
     "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
     "For questions comparing a period to a 7-day average, define the target period explicitly. If the user does not name the target period, use yesterday as the target day and the seven complete days immediately before yesterday as the baseline. " +
