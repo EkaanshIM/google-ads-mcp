@@ -87,7 +87,8 @@ function requestPolicy(message) {
   const rules = [
     "Use tools to verify data; do not answer Google Ads counts or metrics from memory.",
     "For count-only questions, prefer count_entities/count_rows over search.",
-    "For campaign ranking, product status, 7-day comparison, or account summary questions, prefer deterministic analytics tools over raw search."
+    "For campaign ranking, product status, 7-day comparison, or account summary questions, prefer deterministic analytics tools over raw search.",
+    "Always present Google Ads money values as INR; never use $ or USD for this account."
   ];
 
   if (
@@ -338,6 +339,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
     "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, diagnose_campaign_period for campaign diagnostic reporting and recommendations, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
+    "All Google Ads currency values in this app must be presented as INR. Never use $, USD, or any non-INR currency symbol for cost, spend, CPC, CPA, or budget values. If a tool returns numeric cost values, label them as INR. " +
     "When a Google Ads field requires an equality filter, scoped query, or cannot be used for a cross-entity comparison in one GAQL query, decompose the task into multiple valid tool queries and post-process/count/rank/compare the fetched results. Do not refuse solely because the comparison cannot be done in a single query. " +
     "If a deterministic tool returns partial results to avoid timeout, present the partial result with the scanned/available scope rather than failing. " +
     "For product issue questions, use count_products_by_issue. If a selected field is not filterable, do not refuse; fetch the selectable field with a finite tool strategy and post-process/count server-side using the deterministic tool. " +
@@ -347,9 +349,9 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For broad listing questions, request only the fields needed, always use a LIMIT, and summarize instead of returning huge raw result sets. If the user asks for all rows and the result may be large, ask them to narrow the request or provide a small sample with the total count. " +
     "When a request requires calculations, comparisons, deltas, averages, rankings, totals, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
     "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
-    "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Include customer.currency_code when presenting money if it is not already known. " +
+    "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Present money as INR even if customer.currency_code is missing or unexpected. " +
     "For conversions, use metrics.conversions unless the user asks for a more specific conversion metric. " +
-    "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, and customer.currency_code when money is shown. Convert average_cpc and cost_micros from micros to currency units. " +
+    "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, and metrics.cost_micros. Convert average_cpc and cost_micros from micros to currency units and present them as INR. " +
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
     "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
     "For campaign recommendation questions, produce decision-ready diagnostic reporting: summarize what went right, what went wrong, likely metric-based reasons, and suggested modifications. Keep recommendations grounded in tool data and say they should be validated against business goals, margins, inventory, and conversion quality. " +

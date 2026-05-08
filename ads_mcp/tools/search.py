@@ -39,6 +39,8 @@ _METRIC_ALIASES = {
     "cost_per_conversion": "metrics.cost_per_conversion",
 }
 
+DEFAULT_CURRENCY_CODE = "INR"
+
 _PRODUCT_CAMPAIGN_OVERLAP_CACHE: Dict[Any, Dict[str, Any]] = {}
 _PRODUCT_CAMPAIGN_OVERLAP_CACHE_LOCK = threading.Lock()
 _PRODUCT_CAMPAIGN_OVERLAP_CACHE_TTL_SECONDS = 600
@@ -146,6 +148,16 @@ def _money_units(value_micros: float) -> float:
     return value_micros / 1_000_000
 
 
+def _has_money_field(fields: List[str]) -> bool:
+    money_fields = {
+        "metrics.cost_micros",
+        "metrics.average_cpc",
+        "metrics.cost_per_conversion",
+        "customer.currency_code",
+    }
+    return any(field in money_fields for field in fields or [])
+
+
 def _campaign_metric_bundle(row: Dict[str, Any]) -> Dict[str, Any]:
     cost_micros = _row_float(row, "metrics.cost_micros")
     avg_cpc_micros = _row_float(row, "metrics.average_cpc")
@@ -164,7 +176,7 @@ def _campaign_metric_bundle(row: Dict[str, Any]) -> Dict[str, Any]:
         "cost_per_conversion": (
             _money_units(cost_micros) / conversions if conversions else None
         ),
-        "currency_code": _row_value(row, "customer.currency_code", ""),
+        "currency_code": DEFAULT_CURRENCY_CODE,
     }
 
 
@@ -325,12 +337,14 @@ def search(
         customer_id=customer_id, query=query
     )
 
+    force_inr_currency = _has_money_field(fields)
     final_output: List = []
     for batch in query_result:
         for row in batch.results:
-            final_output.append(
-                utils.format_output_row(row, batch.field_mask.paths)
-            )
+            formatted_row = utils.format_output_row(row, batch.field_mask.paths)
+            if force_inr_currency:
+                formatted_row["customer.currency_code"] = DEFAULT_CURRENCY_CODE
+            final_output.append(formatted_row)
     return final_output
 
 
@@ -561,13 +575,13 @@ def diagnose_campaign_period(
         "conversions": 0.0,
     }
     weeks = set()
-    currency_code = ""
+    currency_code = DEFAULT_CURRENCY_CODE
 
     for row in rows:
         campaign_id = _row_value(row, "campaign.id")
         week = _row_value(row, "segments.week", "")
         weeks.add(week)
-        currency_code = currency_code or _row_value(row, "customer.currency_code", "")
+        currency_code = DEFAULT_CURRENCY_CODE
         entry = by_campaign.setdefault(
             campaign_id,
             {
@@ -1236,7 +1250,7 @@ def account_metric_summary(
     return {
         "customer_id": customer_id,
         "account_name": _row_value(row, "customer.descriptive_name"),
-        "currency_code": _row_value(row, "customer.currency_code"),
+        "currency_code": DEFAULT_CURRENCY_CODE,
         "date_start": date_start,
         "date_end": date_end,
         "metrics": summary,
