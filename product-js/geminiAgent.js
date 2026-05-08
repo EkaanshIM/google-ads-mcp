@@ -185,6 +185,26 @@ function requestPolicy(message) {
     );
   }
 
+  if (
+    normalized.includes("campaign") &&
+    (normalized.includes("recommend") ||
+      normalized.includes("modification") ||
+      normalized.includes("modify") ||
+      normalized.includes("what went right") ||
+      normalized.includes("what went wrong") ||
+      normalized.includes("right and wrong") ||
+      normalized.includes("improve") ||
+      normalized.includes("optimise") ||
+      normalized.includes("optimize"))
+  ) {
+    rules.push(
+      "For campaign diagnostic reporting, what-went-right/wrong, and recommendation questions, use diagnose_campaign_period when the user provides or implies a finite date range.",
+      "Do provide practical recommended modifications when grounded in fetched metrics. Phrase them as suggested optimizations, not guaranteed outcomes.",
+      "Base recommendations on clicks, impressions, cost, conversions, CTR, average CPC, conversion rate, CPA, and trend deltas; do not refuse only because business goals are not fully known.",
+      "If business context is missing, still provide metric-based recommendations and clearly mention that final action should consider margins, inventory, conversion quality, and business priorities."
+    );
+  }
+
   return rules.map((rule) => `- ${rule}`).join("\n");
 }
 
@@ -317,7 +337,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
-    "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
+    "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, diagnose_campaign_period for campaign diagnostic reporting and recommendations, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
     "When a Google Ads field requires an equality filter, scoped query, or cannot be used for a cross-entity comparison in one GAQL query, decompose the task into multiple valid tool queries and post-process/count/rank/compare the fetched results. Do not refuse solely because the comparison cannot be done in a single query. " +
     "If a deterministic tool returns partial results to avoid timeout, present the partial result with the scanned/available scope rather than failing. " +
     "For product issue questions, use count_products_by_issue. If a selected field is not filterable, do not refuse; fetch the selectable field with a finite tool strategy and post-process/count server-side using the deterministic tool. " +
@@ -332,6 +352,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.cost_micros, and customer.currency_code when money is shown. Convert average_cpc and cost_micros from micros to currency units. " +
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
     "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
+    "For campaign recommendation questions, produce decision-ready diagnostic reporting: summarize what went right, what went wrong, likely metric-based reasons, and suggested modifications. Keep recommendations grounded in tool data and say they should be validated against business goals, margins, inventory, and conversion quality. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
     "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
     "For questions comparing a period to a 7-day average, define the target period explicitly. If the user does not name the target period, use yesterday as the target day and the seven complete days immediately before yesterday as the baseline. " +

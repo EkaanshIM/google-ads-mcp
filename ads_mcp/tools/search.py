@@ -202,6 +202,72 @@ def _campaign_score(metrics: Dict[str, Any], metric: str, scoring_mode: str):
     return metrics["conversions"]
 
 
+def _safe_pct_change(current: float, previous: float):
+    if previous == 0:
+        return None
+    return ((current - previous) / previous) * 100
+
+
+def _campaign_diagnostic_metrics(values: Dict[str, float]) -> Dict[str, Any]:
+    clicks = float(values.get("clicks", 0) or 0)
+    impressions = float(values.get("impressions", 0) or 0)
+    cost_micros = float(values.get("cost_micros", 0) or 0)
+    conversions = float(values.get("conversions", 0) or 0)
+    cost = _money_units(cost_micros)
+    return {
+        "clicks": clicks,
+        "impressions": impressions,
+        "cost": cost,
+        "cost_micros": cost_micros,
+        "conversions": conversions,
+        "ctr": clicks / impressions if impressions else 0,
+        "average_cpc": cost / clicks if clicks else None,
+        "conversion_rate": conversions / clicks if clicks else 0,
+        "cost_per_conversion": cost / conversions if conversions else None,
+    }
+
+
+def _diagnostic_recommendations(metrics: Dict[str, Any], deltas: Dict[str, Any]) -> List[str]:
+    recommendations = []
+    conversions = metrics["conversions"]
+    cost = metrics["cost"]
+    clicks = metrics["clicks"]
+    impressions = metrics["impressions"]
+    cpa = metrics["cost_per_conversion"]
+    ctr = metrics["ctr"]
+    conversion_rate = metrics["conversion_rate"]
+    conv_change = deltas.get("conversions_pct_change")
+    cost_change = deltas.get("cost_pct_change")
+    click_change = deltas.get("clicks_pct_change")
+
+    if conversions > 0 and conv_change is not None and conv_change >= 20:
+        recommendations.append(
+            "Consider scaling budget or bid coverage cautiously because conversions improved strongly in the latest half of the period."
+        )
+    if cost > 0 and conversions == 0:
+        recommendations.append(
+            "Review spend leakage: this campaign spent without conversions, so check search terms, targeting, products/assets, and landing-page relevance before increasing budget."
+        )
+    if cpa is not None and cost_change is not None and conv_change is not None and cost_change > conv_change + 20:
+        recommendations.append(
+            "Cost is growing faster than conversions, so review bids/budget and cut low-intent queries or weak product groups."
+        )
+    if impressions > 0 and ctr < 0.01:
+        recommendations.append(
+            "CTR is low, so refresh ad assets, titles, descriptions, or audience/query targeting to improve relevance."
+        )
+    if clicks >= 30 and conversion_rate < 0.01:
+        recommendations.append(
+            "Clicks are not converting well, so check landing page experience, offer, tracking, and product/feed quality."
+        )
+    if click_change is not None and click_change < -25 and conversions > 0:
+        recommendations.append(
+            "Traffic dropped while the campaign still converts, so check budget limits, lost impression share, bid competitiveness, and eligibility issues."
+        )
+
+    return recommendations[:3]
+
+
 def _product_status_conditions(status_group: str | None) -> List[str]:
     normalized = (status_group or "all").strip().lower()
     if normalized in {"all", "any", ""}:
@@ -437,6 +503,210 @@ def rank_campaigns(
         "candidate_count": len(ranked),
         "best": ranked[:final_top_n],
         "worst": list(reversed(ranked[-final_top_n:])) if ranked else [],
+    }
+
+
+@mcp.tool()
+def diagnose_campaign_period(
+    customer_id: str,
+    date_start: str,
+    date_end: str,
+    status: str = "ENABLED",
+    top_n: int = 8,
+) -> Dict[str, Any]:
+    """Diagnoses campaign performance and recommends optimization actions.
+
+    Use this when the user asks what went right/wrong, why performance changed,
+    or what campaign modifications are recommended for a period such as 4 weeks.
+    The tool fetches campaign metrics by week, computes totals and period-half
+    deltas, and returns grounded recommendations from the fetched data.
+
+    Args:
+        customer_id: The id of the customer
+        date_start: YYYY-MM-DD start date
+        date_end: YYYY-MM-DD end date
+        status: Campaign status filter, usually ENABLED; use ALL for no status filter
+        top_n: Number of strongest/weakest campaign diagnostics to return
+    """
+
+    final_top_n = max(1, min(int(top_n or 8), 25))
+    fields = [
+        "campaign.id",
+        "campaign.name",
+        "campaign.status",
+        "segments.week",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.cost_micros",
+        "metrics.conversions",
+        "customer.currency_code",
+    ]
+    conditions = []
+    conditions.extend(_status_condition("campaign", status))
+    conditions.extend(_date_range_conditions(date_start, date_end))
+
+    rows = search(
+        customer_id=customer_id,
+        fields=fields,
+        resource="campaign",
+        conditions=conditions,
+        limit=50000,
+    )
+
+    by_campaign: Dict[Any, Dict[str, Any]] = {}
+    account_totals = {
+        "clicks": 0.0,
+        "impressions": 0.0,
+        "cost_micros": 0.0,
+        "conversions": 0.0,
+    }
+    weeks = set()
+    currency_code = ""
+
+    for row in rows:
+        campaign_id = _row_value(row, "campaign.id")
+        week = _row_value(row, "segments.week", "")
+        weeks.add(week)
+        currency_code = currency_code or _row_value(row, "customer.currency_code", "")
+        entry = by_campaign.setdefault(
+            campaign_id,
+            {
+                "campaign_id": campaign_id,
+                "campaign_name": _row_value(row, "campaign.name"),
+                "campaign_status": _row_value(row, "campaign.status"),
+                "weeks": {},
+                "totals_raw": {
+                    "clicks": 0.0,
+                    "impressions": 0.0,
+                    "cost_micros": 0.0,
+                    "conversions": 0.0,
+                },
+            },
+        )
+        raw = {
+            "clicks": _row_float(row, "metrics.clicks"),
+            "impressions": _row_float(row, "metrics.impressions"),
+            "cost_micros": _row_float(row, "metrics.cost_micros"),
+            "conversions": _row_float(row, "metrics.conversions"),
+        }
+        entry["weeks"][week] = _campaign_diagnostic_metrics(raw)
+        for key, value in raw.items():
+            entry["totals_raw"][key] += value
+            account_totals[key] += value
+
+    sorted_weeks = sorted(day for day in weeks if day)
+    split_index = max(1, len(sorted_weeks) // 2) if sorted_weeks else 0
+    earlier_weeks = set(sorted_weeks[:split_index])
+    later_weeks = set(sorted_weeks[split_index:])
+
+    diagnostics = []
+    for entry in by_campaign.values():
+        earlier_raw = {
+            "clicks": 0.0,
+            "impressions": 0.0,
+            "cost_micros": 0.0,
+            "conversions": 0.0,
+        }
+        later_raw = dict(earlier_raw)
+
+        for week, metrics in entry["weeks"].items():
+            target = later_raw if week in later_weeks else earlier_raw
+            target["clicks"] += metrics["clicks"]
+            target["impressions"] += metrics["impressions"]
+            target["cost_micros"] += metrics["cost_micros"]
+            target["conversions"] += metrics["conversions"]
+
+        totals = _campaign_diagnostic_metrics(entry["totals_raw"])
+        earlier = _campaign_diagnostic_metrics(earlier_raw)
+        later = _campaign_diagnostic_metrics(later_raw)
+        deltas = {
+            "clicks_pct_change": _safe_pct_change(later["clicks"], earlier["clicks"]),
+            "impressions_pct_change": _safe_pct_change(
+                later["impressions"], earlier["impressions"]
+            ),
+            "cost_pct_change": _safe_pct_change(later["cost"], earlier["cost"]),
+            "conversions_pct_change": _safe_pct_change(
+                later["conversions"], earlier["conversions"]
+            ),
+            "cost_per_conversion_pct_change": _safe_pct_change(
+                later["cost_per_conversion"] or 0,
+                earlier["cost_per_conversion"] or 0,
+            ),
+        }
+        efficiency_score = (
+            (totals["conversions"] * 1000)
+            + (totals["clicks"] * 2)
+            + (totals["ctr"] * 10000)
+            - ((totals["cost_per_conversion"] or totals["cost"]) * 10)
+        )
+        risk_score = (
+            (totals["cost"] if totals["conversions"] == 0 else 0)
+            + max(0, totals["clicks"] - (totals["conversions"] * 30))
+            + max(0, (deltas["cost_pct_change"] or 0) - (deltas["conversions_pct_change"] or 0))
+        )
+        diagnostics.append(
+            {
+                "campaign_id": entry["campaign_id"],
+                "campaign_name": entry["campaign_name"],
+                "campaign_status": entry["campaign_status"],
+                "totals": totals,
+                "earlier_period": {
+                    "weeks": sorted(earlier_weeks),
+                    "metrics": earlier,
+                },
+                "later_period": {
+                    "weeks": sorted(later_weeks),
+                    "metrics": later,
+                },
+                "deltas": deltas,
+                "recommendations": _diagnostic_recommendations(totals, deltas),
+                "efficiency_score": efficiency_score,
+                "risk_score": risk_score,
+            }
+        )
+
+    winners = sorted(diagnostics, key=lambda item: item["efficiency_score"], reverse=True)
+    risks = sorted(diagnostics, key=lambda item: item["risk_score"], reverse=True)
+    conversion_gainers = sorted(
+        diagnostics,
+        key=lambda item: item["deltas"]["conversions_pct_change"]
+        if item["deltas"]["conversions_pct_change"] is not None
+        else float("-inf"),
+        reverse=True,
+    )
+    conversion_decliners = sorted(
+        diagnostics,
+        key=lambda item: item["deltas"]["conversions_pct_change"]
+        if item["deltas"]["conversions_pct_change"] is not None
+        else float("inf"),
+    )
+
+    return {
+        "customer_id": customer_id,
+        "date_start": date_start,
+        "date_end": date_end,
+        "status": status,
+        "currency_code": currency_code,
+        "campaign_count": len(diagnostics),
+        "weeks": sorted_weeks,
+        "comparison_method": (
+            "Campaign totals are compared between the earlier half and later "
+            "half of the selected weeks. Recommendations are heuristic and "
+            "grounded only in clicks, impressions, conversions, cost, CTR, CPC, "
+            "conversion rate, and CPA."
+        ),
+        "account_totals": _campaign_diagnostic_metrics(account_totals),
+        "what_went_right": winners[:final_top_n],
+        "what_went_wrong": risks[:final_top_n],
+        "conversion_gainers": conversion_gainers[:final_top_n],
+        "conversion_decliners": conversion_decliners[:final_top_n],
+        "recommended_modification_types": [
+            "Scale budget/bids cautiously on campaigns with conversion growth and acceptable CPA.",
+            "Reduce or restructure spend on campaigns spending without conversions.",
+            "Review search terms, targeting, product groups, and placements where clicks are high but conversion rate is low.",
+            "Refresh ad assets/feed titles/descriptions where impressions are high but CTR is weak.",
+            "Check landing page, tracking, offer, and product eligibility where traffic does not convert.",
+        ],
     }
 
 
