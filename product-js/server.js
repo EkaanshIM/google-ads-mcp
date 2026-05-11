@@ -99,8 +99,13 @@ app.post("/api/chat", async (req, res) => {
   const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
   const customerId = resolvedCustomerId(requestedCustomerId);
   const requestedSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
-  const sessionId = normalizeSessionId(requestedSessionId) || crypto.randomUUID();
+  const cookieSessionId = parseCookieHeader(req.headers.cookie || "").googleAdsDemoSessionId || "";
+  const sessionId =
+    normalizeSessionId(requestedSessionId) ||
+    normalizeSessionId(cookieSessionId) ||
+    crypto.randomUUID();
   if (!message) return res.status(400).json({ error: "message is required" });
+  res.setHeader("Set-Cookie", sessionCookie(sessionId));
 
   const jobId = crypto.randomUUID();
   const conversationHistory = await readSessionTurns(sessionId);
@@ -162,6 +167,30 @@ function resolvedCustomerId(customerId) {
 
 function jobFilePath(jobId) {
   return path.join(chatJobsDir, `${jobId}.json`);
+}
+
+function parseCookieHeader(cookieHeader) {
+  return String(cookieHeader || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const separator = part.indexOf("=");
+      if (separator <= 0) return cookies;
+      const key = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      try {
+        cookies[key] = decodeURIComponent(value);
+      } catch {
+        cookies[key] = value;
+      }
+      return cookies;
+    }, {});
+}
+
+function sessionCookie(sessionId) {
+  const maxAgeSeconds = 60 * 60 * 24 * 30;
+  return `googleAdsDemoSessionId=${encodeURIComponent(sessionId)}; Path=/; Max-Age=${maxAgeSeconds}; SameSite=Lax`;
 }
 
 function normalizeSessionId(sessionId) {

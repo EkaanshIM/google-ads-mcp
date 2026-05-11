@@ -44,6 +44,7 @@
     <script>
       let activePoll = null;
       const CUSTOMER_ID_KEY = 'googleAdsDemo.customerId';
+      const SESSION_ID_KEY = 'googleAdsDemo.sessionId';
       const FALLBACK_CUSTOMER_ID = '6475421500';
 
       function setStatus(text) {
@@ -67,6 +68,27 @@
           }
         } catch {
           // Ignore storage failures and continue without persistence.
+        }
+      }
+
+      function getSessionId() {
+        try {
+          let sessionId = localStorage.getItem(SESSION_ID_KEY) || '';
+          if (!sessionId && window.crypto?.randomUUID) {
+            sessionId = window.crypto.randomUUID();
+            localStorage.setItem(SESSION_ID_KEY, sessionId);
+          }
+          return sessionId;
+        } catch {
+          return '';
+        }
+      }
+
+      function storeSessionId(value) {
+        try {
+          if (value) localStorage.setItem(SESSION_ID_KEY, value);
+        } catch {
+          // Ignore storage failures; the backend cookie fallback still keeps context.
         }
       }
 
@@ -95,8 +117,9 @@
         const out = document.getElementById('out');
         try {
           const job = await fetchJson(`/api/chat/${jobId}`);
+          if (job?.sessionId) storeSessionId(job.sessionId);
           const status = job?.status || 'unknown';
-          setStatus(`Job ${jobId}: ${status}`);
+          setStatus(`Job ${jobId}: ${status}${job?.sessionId ? ` | Session ${job.sessionId}` : ''}`);
           if (status === 'completed') {
             out.textContent = job?.result?.text || job?.text || JSON.stringify(job, null, 2);
           } else if (status === 'failed') {
@@ -125,6 +148,7 @@
         setStatus('Creating async job...');
 
         const customerId = effectiveCustomerId();
+        const sessionId = getSessionId();
         const message = document.getElementById('message').value.trim();
         if (!message) {
           out.textContent = 'Message is required.';
@@ -139,11 +163,12 @@
           const response = await fetchJson('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message, customerId })
+            body: JSON.stringify({ message, customerId, sessionId })
           });
+          if (response?.sessionId) storeSessionId(response.sessionId);
           if (response?.status === 'completed') {
             out.textContent = response?.text || response?.result?.text || JSON.stringify(response, null, 2);
-            setStatus('Completed without polling.');
+            setStatus(`Completed without polling.${response?.sessionId ? ` Session ${response.sessionId}.` : ''}`);
             return;
           }
 
@@ -154,7 +179,7 @@
           }
 
           out.textContent = JSON.stringify(response, null, 2);
-          setStatus(`Job ${response.jobId}: ${response.status}`);
+          setStatus(`Job ${response.jobId}: ${response.status}${response?.sessionId ? ` | Session ${response.sessionId}` : ''}`);
           await pollJob(response.jobId);
         } catch (e) {
           stopPolling();
@@ -165,8 +190,9 @@
 
       (function initCustomerId() {
         const initial = getStoredCustomerId() || FALLBACK_CUSTOMER_ID;
+        const sessionId = getSessionId();
         document.getElementById('customerId').value = initial;
-        setStatus(`Using default customer id ${initial}.`);
+        setStatus(`Using default customer id ${initial}.${sessionId ? ` Session ${sessionId}.` : ''}`);
       })();
     </script>
   </body>

@@ -95,7 +95,7 @@ function formatConversationContext(history = []) {
     .filter(Boolean);
 
   return recentTurns.length
-    ? `Recent conversation context. Use this to resolve follow-up questions, pronouns, date ranges, campaign references, and prior recommendations. Do not repeat old answers unless the user asks.\n${recentTurns.join("\n")}`
+    ? `Recent conversation context. This is active session memory, not background trivia. Use it to resolve follow-up questions, pronouns, omitted date ranges, campaign references, metrics, products, keywords, and prior recommendations. If the latest user asks a short follow-up like "what about spending", infer the same account and date range/entity from the immediately previous relevant turn. Do not ask for a date range or entity that is already clear from this context.\n${recentTurns.join("\n")}`
     : "";
 }
 
@@ -103,6 +103,7 @@ function requestPolicy(message) {
   const normalized = String(message || "").toLowerCase();
   const rules = [
     "Use tools to verify data; do not answer Google Ads counts or metrics from memory.",
+    "If this is a follow-up question, use recent conversation context to resolve omitted date ranges, account, campaign, product, keyword, or metric references before asking a clarification.",
     "For count-only questions, prefer count_entities/count_rows over search.",
     "For campaign ranking, product status, 7-day comparison, or account summary questions, prefer deterministic analytics tools over raw search.",
     "Always present Google Ads money values as INR; never use $ or USD for this account."
@@ -222,6 +223,8 @@ function requestPolicy(message) {
       "Avoid generic advice like 'refresh creatives' or 'review keywords' unless it is tied to the exact campaigns, products, search terms, keywords, ad groups, or metrics that changed.",
       "When the user asks for deeper insight, drill down into the concrete drivers available through tools: products that started dropping, products with clicks and no conversions, rising-cost or falling-CTR keywords, search terms wasting spend, winning terms to scale, and campaign/ad group segments causing the trend.",
       "For each recommendation, include what to change, how to do it, why the data supports it, the expected directional impact, and what metric/date range to monitor after the change.",
+      "When recommending keyword changes, name the actual keyword/search term text from fetched data. For expansion, suggest exact candidate keywords or search terms only when they are derived from working search terms, converting products, landing page/product text available in fetched data, or clearly labeled as hypotheses.",
+      "When recommending bid or price changes, calculate a numeric recommended range from available data such as current CPC, CPA, conversion rate, target CPA, margin, conversion value, or ROAS. If margin/target CPA is missing, state the formula and provide a conservative metric-based range, not a single unsupported number.",
       "If business context is missing, still provide metric-based recommendations and clearly mention that final action should consider margins, inventory, conversion quality, and business priorities."
     );
   }
@@ -354,12 +357,16 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
     "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
     "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
     "Always aim for a useful, decision-ready answer: answer the user's direct question first, then add the most meaningful supporting insights available from the fetched data. " +
+    "Accuracy matters more than sounding confident. Never invent campaigns, products, keywords, search terms, prices, bids, causes, or expected impact. If a recommendation needs data that is not yet available, fetch it with tools when possible; otherwise label the missing input and give the exact formula or next query needed. " +
+    "Treat recent conversation context as active memory. For follow-up questions, inherit the prior account, date range, campaign/product/keyword scope, and metric subject when the user omits them. Example: after 'help me with yesterday conversion', 'what about spending' means spending for the same customer and yesterday. " +
     "When tool results include relevant supporting metrics, include them instead of giving a bare one-line answer. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. " +
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For optimization and diagnostic answers, be specific before being strategic. Name the actual campaigns, ad groups, products, search terms, keywords, assets, or segments that are driving the metric change when tools can fetch them. " +
     "Do not stop at generic advice. For every major recommendation, include: evidence from the data, the exact change to make, how to make it in Google Ads or the feed, expected directional impact, risk/guardrail, and what to check next. " +
     "When the data needed for a detailed diagnosis is not yet fetched, run additional focused drill-down queries before answering instead of saying to 'review' something. Useful drill-downs include product trend drops, dead-click products with spend/clicks and zero conversions, search terms with spend and no conversions, keywords with rising CPC or falling CTR, and products/terms that gained conversions efficiently. " +
+    "For keyword advice, do not say 'add new keywords' generically. Provide actual keyword/search term text from fetched search term or keyword data, identify match type suggestions when reasonable, and separate scale candidates from negative keyword candidates. " +
+    "For bid or pricing advice, do not say 'adjust bids' generically. Provide a numeric bid/CPC/CPA/ROAS range when data supports it, explain the calculation, and include a guardrail such as max CPC, target CPA, or minimum conversion volume. If the account uses Smart Bidding and manual CPC is not applicable, recommend target CPA/ROAS or budget changes instead of fake keyword-level CPCs. " +
     "Use clear readable formatting with short sections, tables where helpful, and action bullets that start with a verb. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
     "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, diagnose_campaign_period for campaign diagnostic reporting and recommendations, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
@@ -375,6 +382,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
     "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
     "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Present money as INR even if customer.currency_code is missing or unexpected. " +
     "For conversions, use metrics.conversions unless the user asks for a more specific conversion metric. " +
+    "For spending, spend, cost, or budget follow-up questions, use metrics.cost_micros over the resolved date range and convert to INR. If the user says 'what about spending' after a previous dated metric question, use the previous date range instead of asking again. " +
     "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, and metrics.cost_micros. Convert average_cpc and cost_micros from micros to currency units and present them as INR. " +
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
     "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
