@@ -15,6 +15,7 @@ const __dirname = path.dirname(__filename);
 // located next to this server entrypoint.
 dotenv.config({ path: path.join(__dirname, ".env") });
 const chatJobsDir = path.join(__dirname, "data", "chat-jobs");
+const chatSessionsDir = path.join(__dirname, "data", "chat-sessions");
 const INLINE_RESPONSE_TIMEOUT_MS = 10_000;
 const activeJobPromises = new Map();
 
@@ -97,14 +98,19 @@ app.post("/api/chat", async (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
   const customerId = resolvedCustomerId(requestedCustomerId);
+  const requestedSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+  const sessionId = normalizeSessionId(requestedSessionId) || crypto.randomUUID();
   if (!message) return res.status(400).json({ error: "message is required" });
 
   const jobId = crypto.randomUUID();
+  const conversationHistory = await readSessionTurns(sessionId);
   const job = {
     id: jobId,
     status: "queued",
     message,
     customerId,
+    sessionId,
+    conversationHistory,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -112,6 +118,8 @@ app.post("/api/chat", async (req, res) => {
   try {
     await logDebugEvent("frontend.chat_request_received", {
       jobId,
+      sessionId,
+      conversationTurns: conversationHistory.length,
       message,
       requestedCustomerId,
       resolvedCustomerId: customerId,
@@ -133,6 +141,7 @@ app.post("/api/chat", async (req, res) => {
 
     res.status(202).json({
       jobId,
+      sessionId,
       status: job.status,
       pollUrl: `/api/chat/${jobId}`
     });
@@ -153,6 +162,55 @@ function resolvedCustomerId(customerId) {
 
 function jobFilePath(jobId) {
   return path.join(chatJobsDir, `${jobId}.json`);
+}
+
+function normalizeSessionId(sessionId) {
+  if (!sessionId) return "";
+  return /^[a-zA-Z0-9_-]{8,80}$/.test(sessionId) ? sessionId : "";
+}
+
+function sessionFilePath(sessionId) {
+  return path.join(chatSessionsDir, `${sessionId}.json`);
+}
+
+async function readSessionTurns(sessionId) {
+  if (!sessionId) return [];
+  try {
+    const raw = await fs.readFile(sessionFilePath(sessionId), "utf8");
+    const session = JSON.parse(raw);
+    return Array.isArray(session?.turns) ? session.turns : [];
+  } catch (e) {
+    if (e?.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+async function appendSessionTurns(sessionId, turns) {
+  if (!sessionId || !Array.isArray(turns) || !turns.length) return;
+  const existingTurns = await readSessionTurns(sessionId);
+  const cleanedTurns = turns
+    .map((turn) => ({
+      role: turn?.role === "assistant" ? "assistant" : "user",
+      text: String(turn?.text || "").trim().slice(0, 12000),
+      at: turn?.at || new Date().toISOString()
+    }))
+    .filter((turn) => turn.text);
+
+  const nextTurns = [...existingTurns, ...cleanedTurns].slice(-20);
+  await fs.mkdir(chatSessionsDir, { recursive: true });
+  await fs.writeFile(
+    sessionFilePath(sessionId),
+    JSON.stringify(
+      {
+        id: sessionId,
+        updatedAt: new Date().toISOString(),
+        turns: nextTurns
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
 }
 
 async function writeJob(job) {
@@ -368,6 +426,7 @@ async function runChatJob(job) {
   const context = {
     jobId: job.id,
     customerId: job.customerId,
+    sessionId: job.sessionId,
     userMessage: job.message
   };
 
@@ -382,7 +441,8 @@ async function runChatJob(job) {
   const out = await runGeminiWithMcp({
     message: job.message,
     customerId: job.customerId,
-    jobId: job.id
+    jobId: job.id,
+    conversationHistory: job.conversationHistory || []
   });
   return {
     ...out,
@@ -400,8 +460,13 @@ async function queueChatJob(job) {
       completedAt: new Date().toISOString(),
       result
     });
+    await appendSessionTurns(job.sessionId, [
+      { role: "user", text: job.message, at: job.createdAt },
+      { role: "assistant", text: result?.text || "", at: new Date().toISOString() }
+    ]);
     await logDebugEvent("chat_job.completed", {
       jobId: job.id,
+      sessionId: job.sessionId,
       customerId: job.customerId,
       mode: result?.mode || null,
       textPreview: String(result?.text || "").slice(0, 4000)
@@ -412,8 +477,13 @@ async function queueChatJob(job) {
       completedAt: new Date().toISOString(),
       error: publicErrorMessage(e)
     });
+    await appendSessionTurns(job.sessionId, [
+      { role: "user", text: job.message, at: job.createdAt },
+      { role: "assistant", text: `Request failed: ${publicErrorMessage(e)}`, at: new Date().toISOString() }
+    ]);
     await logDebugEvent("chat_job.failed", {
       jobId: job.id,
+      sessionId: job.sessionId,
       customerId: job.customerId,
       error: publicErrorMessage(e)
     });
@@ -447,6 +517,7 @@ function serializeChatResponse(job) {
       result: job.result || null,
       customerIdUsed: job.result?.customerIdUsed || null,
       mode: job.result?.mode || null,
+      sessionId: job.sessionId || null,
       jobId: job.id
     };
   }
@@ -455,6 +526,7 @@ function serializeChatResponse(job) {
     return {
       status: "failed",
       error: job.error || "Unknown error",
+      sessionId: job.sessionId || null,
       jobId: job.id
     };
   }

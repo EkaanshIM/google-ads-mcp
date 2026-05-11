@@ -82,6 +82,23 @@ function backendTimeZone() {
   return process.env.GOOGLE_ADS_ACCOUNT_TIME_ZONE || process.env.TZ || "Asia/Kolkata";
 }
 
+function formatConversationContext(history = []) {
+  if (!Array.isArray(history) || !history.length) return "";
+
+  const recentTurns = history
+    .slice(-8)
+    .map((turn) => {
+      const role = turn?.role === "assistant" ? "Assistant" : "User";
+      const text = String(turn?.text || "").trim().replace(/\s+/g, " ");
+      return text ? `${role}: ${text.slice(0, 2500)}` : "";
+    })
+    .filter(Boolean);
+
+  return recentTurns.length
+    ? `Recent conversation context. Use this to resolve follow-up questions, pronouns, date ranges, campaign references, and prior recommendations. Do not repeat old answers unless the user asks.\n${recentTurns.join("\n")}`
+    : "";
+}
+
 function requestPolicy(message) {
   const normalized = String(message || "").toLowerCase();
   const rules = [
@@ -202,6 +219,9 @@ function requestPolicy(message) {
       "For campaign diagnostic reporting, what-went-right/wrong, and recommendation questions, use diagnose_campaign_period when the user provides or implies a finite date range.",
       "Do provide practical recommended modifications when grounded in fetched metrics. Phrase them as suggested optimizations, not guaranteed outcomes.",
       "Base recommendations on clicks, impressions, cost, conversions, CTR, average CPC, conversion rate, CPA, and trend deltas; do not refuse only because business goals are not fully known.",
+      "Avoid generic advice like 'refresh creatives' or 'review keywords' unless it is tied to the exact campaigns, products, search terms, keywords, ad groups, or metrics that changed.",
+      "When the user asks for deeper insight, drill down into the concrete drivers available through tools: products that started dropping, products with clicks and no conversions, rising-cost or falling-CTR keywords, search terms wasting spend, winning terms to scale, and campaign/ad group segments causing the trend.",
+      "For each recommendation, include what to change, how to do it, why the data supports it, the expected directional impact, and what metric/date range to monitor after the change.",
       "If business context is missing, still provide metric-based recommendations and clearly mention that final action should consider margins, inventory, conversion quality, and business priorities."
     );
   }
@@ -320,7 +340,7 @@ function instrumentMcpClient(mcpClient, context) {
   });
 }
 
-export async function runGeminiWithMcp({ message, customerId, jobId }) {
+export async function runGeminiWithMcp({ message, customerId, jobId, conversationHistory = [] }) {
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
@@ -337,6 +357,10 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "When tool results include relevant supporting metrics, include them instead of giving a bare one-line answer. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. " +
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
+    "For optimization and diagnostic answers, be specific before being strategic. Name the actual campaigns, ad groups, products, search terms, keywords, assets, or segments that are driving the metric change when tools can fetch them. " +
+    "Do not stop at generic advice. For every major recommendation, include: evidence from the data, the exact change to make, how to make it in Google Ads or the feed, expected directional impact, risk/guardrail, and what to check next. " +
+    "When the data needed for a detailed diagnosis is not yet fetched, run additional focused drill-down queries before answering instead of saying to 'review' something. Useful drill-downs include product trend drops, dead-click products with spend/clicks and zero conversions, search terms with spend and no conversions, keywords with rising CPC or falling CTR, and products/terms that gained conversions efficiently. " +
+    "Use clear readable formatting with short sections, tables where helpful, and action bullets that start with a verb. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
     "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, diagnose_campaign_period for campaign diagnostic reporting and recommendations, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
     "All Google Ads currency values in this app must be presented as INR. Never use $, USD, or any non-INR currency symbol for cost, spend, CPC, CPA, or budget values. If a tool returns numeric cost values, label them as INR. " +
@@ -355,6 +379,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
     "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
     "For campaign recommendation questions, produce decision-ready diagnostic reporting: summarize what went right, what went wrong, likely metric-based reasons, and suggested modifications. Keep recommendations grounded in tool data and say they should be validated against business goals, margins, inventory, and conversion quality. " +
+    "Recommended structure for campaign diagnostics: Executive read, What improved, What declined, Specific drivers, Dead-click/wasted-spend opportunities, Working keywords/search terms/products to scale, Action plan with how/why/expected impact, and Monitoring checklist. Omit sections only when they truly do not apply. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
     "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
     "For questions comparing a period to a 7-day average, define the target period explicitly. If the user does not name the target period, use yesterday as the target day and the seven complete days immediately before yesterday as the baseline. " +
@@ -369,9 +394,10 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
   const understanding = requestPolicy(message);
+  const conversationContext = formatConversationContext(conversationHistory);
   const userText = effectiveCustomerId
-    ? `Customer ID: ${effectiveCustomerId}\n\nCritical query policy for this request:\n${understanding}\n\nUser request:\n${message}`
-    : `Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`;
+    ? `Customer ID: ${effectiveCustomerId}\n\n${conversationContext ? `${conversationContext}\n\n` : ""}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`
+    : `${conversationContext ? `${conversationContext}\n\n` : ""}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`;
 
   const prompt = `${systemPrefix}\n\n${userText}`;
   const toolCalls = [];
@@ -379,6 +405,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId }) {
     jobId: jobId || null,
     customerId: effectiveCustomerId || null,
     userMessage: message,
+    conversationTurns: Array.isArray(conversationHistory) ? conversationHistory.length : 0,
     toolCalls
   };
   const { toolCalls: _toolCalls, ...logContext } = context;
