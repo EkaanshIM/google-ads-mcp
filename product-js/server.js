@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logDebugEvent, summarizeMcpResult, debugLogFile } from "./debugLogger.js";
-import { runGeminiWithMcp } from "./geminiAgent.js";
+import { runGeminiUnderstanding, runGeminiWithMcp } from "./geminiAgent.js";
 import { getMcpClient } from "./mcp.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -91,6 +91,49 @@ app.post("/api/mcp/call", async (req, res) => {
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e?.message ?? String(e) });
+  }
+});
+
+app.post("/api/chat/understand", async (req, res) => {
+  const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+  const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
+  const customerId = resolvedCustomerId(requestedCustomerId);
+  const requestedSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+  const cookieSessionId = parseCookieHeader(req.headers.cookie || "").googleAdsDemoSessionId || "";
+  const sessionId =
+    normalizeSessionId(requestedSessionId) ||
+    normalizeSessionId(cookieSessionId) ||
+    crypto.randomUUID();
+  if (!message) return res.status(400).json({ error: "message is required" });
+  res.setHeader("Set-Cookie", sessionCookie(sessionId));
+
+  try {
+    const conversationHistory = await readSessionTurns(sessionId);
+    await logDebugEvent("frontend.chat_understanding_received", {
+      sessionId,
+      conversationTurns: conversationHistory.length,
+      message,
+      requestedCustomerId,
+      resolvedCustomerId: customerId,
+      route: "/api/chat/understand",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"] || ""
+    });
+
+    const understanding = await runGeminiUnderstanding({
+      message,
+      customerId,
+      conversationHistory
+    });
+
+    return res.json({
+      status: "ready_for_confirmation",
+      sessionId,
+      customerIdUsed: understanding.customerIdUsed || customerId,
+      understanding: understanding.text
+    });
+  } catch (e) {
+    res.status(500).json({ error: e?.message ?? String(e), sessionId });
   }
 });
 

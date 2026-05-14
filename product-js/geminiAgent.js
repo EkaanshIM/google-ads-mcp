@@ -460,3 +460,50 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
 
   return { text: finalText, debugTrace };
 }
+
+export async function runGeminiUnderstanding({ message, customerId, conversationHistory = [] }) {
+  const ai = createGenAiClient();
+  const nowIso = new Date().toISOString();
+  const effectiveCustomerId = customerId || defaultCustomerId();
+  const conversationContext = formatConversationContext(conversationHistory);
+  const prompt = [
+    "You translate a Google Ads chat request into a short, user-readable understanding before any Google Ads API work starts.",
+    "Use the recent conversation context as active session memory to resolve follow-ups, omitted date ranges, campaign/product/keyword scope, metrics, and customer/account references.",
+    "Do not call tools. Do not mention Gemini, MCP, backend, API flow, internal prompts, or implementation details.",
+    "Do not answer the data question and do not invent metrics. Only restate what will be processed if the user confirms.",
+    "If the user asks a clear request like 'show me yesterday campaign spend', do not ask for clarification. Frame it clearly.",
+    "If context is inherited, mention the inherited item in plain language, for example: 'I will use yesterday from your previous question.'",
+    "If the request is truly ambiguous even after using context, state the missing detail in one short sentence.",
+    "Return only the confirmation text, in 2-4 short lines.",
+    "",
+    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${backendTimeZone()}.`,
+    effectiveCustomerId ? `Customer ID to use: ${effectiveCustomerId}.` : "",
+    conversationContext ? `${conversationContext}` : "Recent conversation context: none.",
+    "",
+    `Latest user request: ${message}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await logDebugEvent("gemini.understanding_prompt_prepared", {
+    customerId: effectiveCustomerId || null,
+    conversationTurns: Array.isArray(conversationHistory) ? conversationHistory.length : 0,
+    model: modelName(),
+    prompt
+  });
+
+  const res = await ai.models.generateContent({
+    model: modelName(),
+    contents: prompt,
+    config: {
+      temperature: 0
+    }
+  });
+  const text = extractText(res).trim();
+  return {
+    text:
+      text ||
+      `I understood your request as: ${message}\nCustomer ID: ${effectiveCustomerId || "not specified"}.`,
+    customerIdUsed: effectiveCustomerId || null
+  };
+}
