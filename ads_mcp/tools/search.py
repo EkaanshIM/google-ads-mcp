@@ -280,6 +280,144 @@ def _diagnostic_recommendations(metrics: Dict[str, Any], deltas: Dict[str, Any])
     return recommendations[:3]
 
 
+def _date_span_days(date_start: str, date_end: str) -> int:
+    try:
+        return max(1, (_date(date_end) - _date(date_start)).days + 1)
+    except Exception:
+        return 1
+
+
+def _currency(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 2)
+
+
+def _pct(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value) * 100, 2)
+
+
+def _scale_budget_decision(
+    metrics: Dict[str, Any],
+    date_start: str,
+    date_end: str,
+    target_cpa: float | None,
+) -> Dict[str, Any] | None:
+    conversions = float(metrics["conversions"] or 0)
+    cpa = metrics["cost_per_conversion"]
+    cost = float(metrics["cost"] or 0)
+    if conversions < 10 or not cpa or cost <= 0:
+        return None
+
+    cpa_limit = float(target_cpa or cpa)
+    cpa_ratio = cpa / cpa_limit if cpa_limit else 1
+    if cpa_ratio <= 0.85 and conversions >= 30:
+        lift_low, lift_high = 0.15, 0.25
+        confidence = "medium"
+    elif cpa_ratio <= 1.0 and conversions >= 30:
+        lift_low, lift_high = 0.10, 0.20
+        confidence = "medium"
+    else:
+        lift_low, lift_high = 0.05, 0.10
+        confidence = "low"
+
+    extra_budget_low = cost * lift_low
+    extra_budget_high = cost * lift_high
+    efficiency_guardrail = 0.7
+    projected_conversions_low = (extra_budget_low / cpa) * efficiency_guardrail
+    projected_conversions_high = (extra_budget_high / cpa) * efficiency_guardrail
+    days = _date_span_days(date_start, date_end)
+
+    return {
+        "type": "scale_budget",
+        "decision": f"Increase budget by {int(lift_low * 100)}-{int(lift_high * 100)}% if CPA stays within guardrail.",
+        "why": (
+            "Campaign has enough conversion volume to test scaling. "
+            "Use a gradual increase because marginal traffic may be less efficient than current traffic."
+        ),
+        "current_period_cost": _currency(cost),
+        "current_cpa": _currency(cpa),
+        "target_or_guardrail_cpa": _currency(cpa_limit),
+        "estimated_extra_period_budget": {
+            "low": _currency(extra_budget_low),
+            "high": _currency(extra_budget_high),
+        },
+        "estimated_extra_daily_budget": {
+            "low": _currency(extra_budget_low / days),
+            "high": _currency(extra_budget_high / days),
+        },
+        "expected_incremental_conversions": {
+            "low": round(projected_conversions_low, 2),
+            "high": round(projected_conversions_high, 2),
+            "calculation": "extra budget / observed CPA * 0.70 efficiency guardrail",
+        },
+        "risk": "If CPA rises above the guardrail or conversion rate drops for 3-5 days, roll back the increase.",
+        "confidence": confidence,
+    }
+
+
+def _bid_decision(metrics: Dict[str, Any], target_cpa: float | None) -> Dict[str, Any] | None:
+    average_cpc = metrics["average_cpc"]
+    cpa = metrics["cost_per_conversion"]
+    conversions = float(metrics["conversions"] or 0)
+    conversion_rate = float(metrics["conversion_rate"] or 0)
+    if not average_cpc or conversions < 10 or not cpa:
+        return None
+
+    cpa_limit = float(target_cpa or cpa)
+    if cpa <= cpa_limit and conversion_rate >= 0.02:
+        lift_low, lift_high = 0.10, 0.15
+    elif cpa <= cpa_limit:
+        lift_low, lift_high = 0.05, 0.10
+    else:
+        return {
+            "type": "bid_guardrail",
+            "decision": "Do not increase bids until CPA improves or a higher target CPA is approved.",
+            "why": "Observed CPA is above the provided/derived guardrail.",
+            "current_average_cpc": _currency(average_cpc),
+            "current_cpa": _currency(cpa),
+            "target_or_guardrail_cpa": _currency(cpa_limit),
+            "risk": "Bid increases can buy more volume but may worsen efficiency when CPA is already above target.",
+            "confidence": "medium",
+        }
+
+    return {
+        "type": "bid_increase",
+        "decision": f"Increase max CPC or bid aggressiveness by {int(lift_low * 100)}-{int(lift_high * 100)}% only on proven terms/ad groups.",
+        "why": "Observed CPA is within guardrail and the campaign converts at meaningful volume.",
+        "current_average_cpc": _currency(average_cpc),
+        "suggested_cpc_range": {
+            "low": _currency(average_cpc * (1 + lift_low)),
+            "high": _currency(average_cpc * (1 + lift_high)),
+        },
+        "current_cpa": _currency(cpa),
+        "target_or_guardrail_cpa": _currency(cpa_limit),
+        "risk": "Apply to proven segments first; avoid account-wide bid lifts without segment checks.",
+        "confidence": "medium",
+    }
+
+
+def _term_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
+    cost = _money_units(_row_float(row, "metrics.cost_micros"))
+    clicks = _row_float(row, "metrics.clicks")
+    conversions = _row_float(row, "metrics.conversions")
+    return {
+        "search_term": _row_value(row, "search_term_view.search_term", ""),
+        "ad_group_id": _row_value(row, "ad_group.id", ""),
+        "ad_group_name": _row_value(row, "ad_group.name", ""),
+        "clicks": clicks,
+        "impressions": _row_float(row, "metrics.impressions"),
+        "cost": _currency(cost),
+        "conversions": conversions,
+        "ctr": _pct(_row_float(row, "metrics.ctr")),
+        "average_cpc": _currency(_money_units(_row_float(row, "metrics.average_cpc"))),
+        "conversion_rate": _pct(conversions / clicks if clicks else 0),
+        "cost_per_conversion": _currency(cost / conversions if conversions else None),
+    }
+
+
 def _product_status_conditions(status_group: str | None) -> List[str]:
     normalized = (status_group or "all").strip().lower()
     if normalized in {"all", "any", ""}:
@@ -721,6 +859,250 @@ def diagnose_campaign_period(
             "Refresh ad assets/feed titles/descriptions where impressions are high but CTR is weak.",
             "Check landing page, tracking, offer, and product eligibility where traffic does not convert.",
         ],
+    }
+
+
+@mcp.tool()
+def campaign_growth_decision_brief(
+    customer_id: str,
+    date_start: str,
+    date_end: str,
+    campaign_id: str = None,
+    campaign_name: str = None,
+    target_cpa: float = None,
+    top_n: int = 8,
+) -> Dict[str, Any]:
+    """Builds a decision-ready growth plan for a campaign.
+
+    Use this when the user wants a business-growth brain, boost plan, exact
+    keyword/search-term ideas, bid/budget changes, expected impact, or what
+    should be done next. Unlike mover diagnostics, this returns action
+    recommendations even when performance is stable.
+
+    Args:
+        customer_id: The id of the customer
+        date_start: YYYY-MM-DD start date
+        date_end: YYYY-MM-DD end date
+        campaign_id: Optional exact campaign id to analyze
+        campaign_name: Optional campaign name to match when id is not provided
+        target_cpa: Optional business target CPA in INR for scaling guardrails
+        top_n: Number of search terms and decisions to return
+    """
+
+    final_top_n = max(1, min(int(top_n or 8), 25))
+    campaign_conditions = _date_range_conditions(date_start, date_end)
+    if campaign_id:
+        campaign_conditions.append(f"campaign.id = {campaign_id}")
+    elif campaign_name:
+        escaped_name = str(campaign_name).replace("\\", "\\\\").replace("'", "\\'")
+        campaign_conditions.append(f"campaign.name = '{escaped_name}'")
+
+    campaign_rows = search(
+        customer_id=customer_id,
+        fields=[
+            "campaign.id",
+            "campaign.name",
+            "campaign.status",
+            "metrics.clicks",
+            "metrics.impressions",
+            "metrics.ctr",
+            "metrics.average_cpc",
+            "metrics.cost_micros",
+            "metrics.conversions",
+            "customer.currency_code",
+        ],
+        resource="campaign",
+        conditions=campaign_conditions,
+        limit=10,
+    )
+
+    if not campaign_rows:
+        return {
+            "customer_id": customer_id,
+            "date_start": date_start,
+            "date_end": date_end,
+            "campaign_id": campaign_id,
+            "campaign_name": campaign_name,
+            "currency_code": DEFAULT_CURRENCY_CODE,
+            "error": "No campaign rows matched the requested scope.",
+        }
+
+    campaign_row = campaign_rows[0]
+    metrics = _campaign_metric_bundle(campaign_row)
+    metrics["conversion_rate"] = (
+        metrics["conversions"] / metrics["clicks"] if metrics["clicks"] else 0
+    )
+    days = _date_span_days(date_start, date_end)
+    decisions = []
+
+    scale_decision = _scale_budget_decision(metrics, date_start, date_end, target_cpa)
+    if scale_decision:
+        decisions.append(scale_decision)
+
+    bid_decision = _bid_decision(metrics, target_cpa)
+    if bid_decision:
+        decisions.append(bid_decision)
+
+    if metrics["impressions"] and metrics["ctr"] < 0.02:
+        decisions.append(
+            {
+                "type": "relevance_lift",
+                "decision": "Improve ad/feed relevance before aggressive scaling.",
+                "why": "CTR is below 2%, so more budget may buy weak traffic unless relevance improves.",
+                "current_ctr": _pct(metrics["ctr"]),
+                "expected_impact": "A 10% CTR lift at the same impressions would add roughly "
+                f"{round(metrics['clicks'] * 0.10, 0)} extra clicks in a similar period.",
+                "risk": "Changing too many assets or feed titles at once makes attribution hard; test the highest-volume theme first.",
+                "confidence": "medium",
+            }
+        )
+
+    if metrics["clicks"] >= 100 and metrics["conversions"] == 0:
+        decisions.append(
+            {
+                "type": "pause_or_restructure",
+                "decision": "Do not boost this campaign yet; isolate wasted spend first.",
+                "why": "The campaign has click volume but no conversions in the selected period.",
+                "risk": "Scaling spend before fixing conversion leakage can increase loss.",
+                "confidence": "high",
+            }
+        )
+
+    search_term_note = None
+    scale_terms: List[Dict[str, Any]] = []
+    negative_terms: List[Dict[str, Any]] = []
+    try:
+        term_conditions = _date_range_conditions(date_start, date_end)
+        if campaign_id:
+            term_conditions.append(f"campaign.id = {campaign_id}")
+        elif campaign_name:
+            escaped_name = str(campaign_name).replace("\\", "\\\\").replace("'", "\\'")
+            term_conditions.append(f"campaign.name = '{escaped_name}'")
+
+        term_rows = search(
+            customer_id=customer_id,
+            fields=[
+                "campaign.id",
+                "campaign.name",
+                "ad_group.id",
+                "ad_group.name",
+                "search_term_view.search_term",
+                "metrics.clicks",
+                "metrics.impressions",
+                "metrics.ctr",
+                "metrics.average_cpc",
+                "metrics.cost_micros",
+                "metrics.conversions",
+            ],
+            resource="search_term_view",
+            conditions=term_conditions,
+            limit=5000,
+        )
+        term_metrics = [_term_metrics(row) for row in term_rows]
+        term_metrics = [term for term in term_metrics if term["search_term"]]
+        scale_terms = sorted(
+            [term for term in term_metrics if term["conversions"] > 0],
+            key=lambda term: (
+                term["conversions"],
+                -(term["cost_per_conversion"] or 10**9),
+                term["clicks"],
+            ),
+            reverse=True,
+        )[:final_top_n]
+
+        observed_cpa = metrics["cost_per_conversion"] or 0
+        waste_threshold = max(observed_cpa * 0.75, metrics["average_cpc"] or 0)
+        negative_terms = sorted(
+            [
+                term
+                for term in term_metrics
+                if term["conversions"] == 0
+                and (
+                    term["clicks"] >= 10
+                    or float(term["cost"] or 0) >= waste_threshold
+                )
+            ],
+            key=lambda term: (float(term["cost"] or 0), term["clicks"]),
+            reverse=True,
+        )[:final_top_n]
+
+        if scale_terms:
+            decisions.append(
+                {
+                    "type": "keyword_expansion",
+                    "decision": "Use converting search terms as exact/phrase keyword or search-theme candidates.",
+                    "exact_terms_to_consider": [term["search_term"] for term in scale_terms],
+                    "why": "These terms already produced conversions in this campaign/date range.",
+                    "expected_impact": "Expected impact depends on added eligible volume; monitor CPA by term for 7 days before expanding further.",
+                    "risk": "Do not add broad variants until exact/phrase candidates hold CPA near campaign average.",
+                    "confidence": "medium",
+                }
+            )
+
+        if negative_terms:
+            decisions.append(
+                {
+                    "type": "negative_keywords",
+                    "decision": "Add non-converting high-cost search terms as negative keywords after checking business relevance.",
+                    "exact_terms_to_review": [term["search_term"] for term in negative_terms],
+                    "why": "These terms consumed clicks/spend without conversions in the selected period.",
+                    "expected_impact": "Savings can be redirected into proven terms; estimate savings from each term's observed cost.",
+                    "risk": "Do not negative terms that are strategically important or have assisted conversions outside this metric view.",
+                    "confidence": "medium",
+                }
+            )
+    except Exception as exc:
+        search_term_note = (
+            "Search-term drilldown was unavailable for this campaign/scope. "
+            f"Reason: {exc}"
+        )
+
+    if not decisions:
+        decisions.append(
+            {
+                "type": "stable_campaign_scale_test",
+                "decision": "Run a controlled 5-10% budget scale test instead of taking no action.",
+                "why": "No strong risk signal was detected, so the next useful business decision is a guarded growth test.",
+                "expected_impact": (
+                    "Use expected extra conversions = extra budget / observed CPA * 0.70. "
+                    "Stop if CPA rises above guardrail."
+                ),
+                "risk": "Stable historical performance does not guarantee stable marginal traffic.",
+                "confidence": "low",
+            }
+        )
+
+    return {
+        "customer_id": customer_id,
+        "date_start": date_start,
+        "date_end": date_end,
+        "currency_code": DEFAULT_CURRENCY_CODE,
+        "campaign": {
+            "campaign_id": metrics["campaign_id"],
+            "campaign_name": metrics["campaign_name"],
+            "campaign_status": metrics["campaign_status"],
+        },
+        "period_days": days,
+        "performance": {
+            "clicks": metrics["clicks"],
+            "impressions": metrics["impressions"],
+            "cost": _currency(metrics["cost"]),
+            "conversions": metrics["conversions"],
+            "ctr": _pct(metrics["ctr"]),
+            "average_cpc": _currency(metrics["average_cpc"]),
+            "conversion_rate": _pct(metrics["conversion_rate"]),
+            "cost_per_conversion": _currency(metrics["cost_per_conversion"]),
+            "average_daily_cost": _currency(metrics["cost"] / days if days else metrics["cost"]),
+        },
+        "decisions": decisions[:final_top_n],
+        "search_term_scale_candidates": scale_terms,
+        "search_term_negative_candidates": negative_terms,
+        "search_term_note": search_term_note,
+        "decision_policy": (
+            "Recommendations are metric-based decisions, not guaranteed outcomes. "
+            "Validate against margin, inventory, conversion quality, and business priority. "
+            "When target_cpa is missing, observed CPA is used as the guardrail."
+        ),
     }
 
 
