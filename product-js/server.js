@@ -155,6 +155,7 @@ app.post("/api/chat", async (req, res) => {
   const job = {
     id: jobId,
     status: "queued",
+    phase: "backend",
     message,
     customerId,
     sessionId,
@@ -191,6 +192,7 @@ app.post("/api/chat", async (req, res) => {
       jobId,
       sessionId,
       status: job.status,
+      phase: job.phase,
       pollUrl: `/api/chat/${jobId}`
     });
   } catch (e) {
@@ -503,10 +505,12 @@ async function runChatJob(job) {
   };
 
   if (isPausedLast24HoursQuestion(job.message)) {
+    await updateJob(job.id, { phase: "ads" });
     return runPausedCampaignFastPath(job.customerId, context);
   }
 
   if (isProductMultipleCampaignCountQuestion(job.message)) {
+    await updateJob(job.id, { phase: "ads" });
     return runProductMultipleCampaignFastPath(job.customerId, context);
   }
 
@@ -514,7 +518,8 @@ async function runChatJob(job) {
     message: job.message,
     customerId: job.customerId,
     jobId: job.id,
-    conversationHistory: job.conversationHistory || []
+    conversationHistory: job.conversationHistory || [],
+    onPhase: async (phase) => updateJob(job.id, { phase })
   });
   return {
     ...out,
@@ -524,11 +529,12 @@ async function runChatJob(job) {
 }
 
 async function queueChatJob(job) {
-  await updateJob(job.id, { status: "running", startedAt: new Date().toISOString() });
+  await updateJob(job.id, { status: "running", phase: "backend", startedAt: new Date().toISOString() });
   try {
     const result = await runChatJob(job);
     await updateJob(job.id, {
       status: "completed",
+      phase: "return",
       completedAt: new Date().toISOString(),
       result
     });
@@ -546,6 +552,7 @@ async function queueChatJob(job) {
   } catch (e) {
     await updateJob(job.id, {
       status: "failed",
+      phase: "error",
       completedAt: new Date().toISOString(),
       error: publicErrorMessage(e)
     });
@@ -590,7 +597,8 @@ function serializeChatResponse(job) {
       customerIdUsed: job.result?.customerIdUsed || null,
       mode: job.result?.mode || null,
       sessionId: job.sessionId || null,
-      jobId: job.id
+      jobId: job.id,
+      phase: job.phase || "return"
     };
   }
 
@@ -599,7 +607,8 @@ function serializeChatResponse(job) {
       status: "failed",
       error: job.error || "Unknown error",
       sessionId: job.sessionId || null,
-      jobId: job.id
+      jobId: job.id,
+      phase: job.phase || "error"
     };
   }
 

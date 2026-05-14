@@ -291,13 +291,14 @@ function formatExecutionTrace({ customerId, understanding, toolCalls }) {
 function instrumentMcpClient(mcpClient, context) {
   const callTool = async (request, options) => {
     const startedAt = new Date().toISOString();
-    const { toolCalls: trace, ...logContext } = context;
+    const { toolCalls: trace, onPhase, ...logContext } = context;
     const traceEntry = {
       startedAt,
       toolName: request?.name,
       toolArguments: request?.arguments || {}
     };
     trace?.push(traceEntry);
+    await onPhase?.("ads");
 
     await logDebugEvent("gemini.mcp_tool_call", {
       ...logContext,
@@ -343,7 +344,7 @@ function instrumentMcpClient(mcpClient, context) {
   });
 }
 
-export async function runGeminiWithMcp({ message, customerId, jobId, conversationHistory = [] }) {
+export async function runGeminiWithMcp({ message, customerId, jobId, conversationHistory = [], onPhase }) {
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
@@ -414,9 +415,10 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
     customerId: effectiveCustomerId || null,
     userMessage: message,
     conversationTurns: Array.isArray(conversationHistory) ? conversationHistory.length : 0,
-    toolCalls
+    toolCalls,
+    onPhase
   };
-  const { toolCalls: _toolCalls, ...logContext } = context;
+  const { toolCalls: _toolCalls, onPhase: _onPhase, ...logContext } = context;
 
   await logDebugEvent("gemini.prompt_prepared", {
     ...logContext,
@@ -430,6 +432,7 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
   const tools = [mcpToTool(instrumentMcpClient(mcpClient, context))];
   const config = geminiConfig(tools);
 
+  await onPhase?.("mcp");
   const res1 = await ai.models.generateContent({
     model: modelName(),
     contents: prompt,
