@@ -49,6 +49,124 @@ function modelName() {
   return process.env.GEMINI_MODEL || "gemini-2.0-flash";
 }
 
+function modelPricingUsdPerMillionTokens(model) {
+  const normalized = String(model || "").toLowerCase();
+  if (normalized.includes("gemini-2.5-flash-lite")) {
+    return {
+      input: 0.10,
+      output: 0.40,
+      source: "Vertex AI official Gemini 2.5 Flash Lite standard text token pricing"
+    };
+  }
+
+  if (normalized.includes("gemini-2.5-flash")) {
+    return {
+      input: 0.30,
+      output: 2.50,
+      source: "Vertex AI official Gemini 2.5 Flash standard text token pricing"
+    };
+  }
+
+  if (normalized.includes("gemini-2.0-flash")) {
+    return {
+      input: 0.15,
+      output: 0.60,
+      source: "Vertex AI official Gemini 2.0 Flash text token pricing"
+    };
+  }
+
+  return {
+    input: null,
+    output: null,
+    source: "unknown model pricing"
+  };
+}
+
+function numericUsageField(usage, field) {
+  const value = Number(usage?.[field]);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function usageFromResponse(res) {
+  const usage = res?.usageMetadata || {};
+  const promptTokens = numericUsageField(usage, "promptTokenCount");
+  const candidatesTokens = numericUsageField(usage, "candidatesTokenCount");
+  const thoughtsTokens = numericUsageField(usage, "thoughtsTokenCount");
+  const toolUsePromptTokens = numericUsageField(usage, "toolUsePromptTokenCount");
+  const cachedContentTokens = numericUsageField(usage, "cachedContentTokenCount");
+  const totalTokens = numericUsageField(usage, "totalTokenCount");
+  return {
+    promptTokens,
+    candidatesTokens,
+    thoughtsTokens,
+    toolUsePromptTokens,
+    cachedContentTokens,
+    totalTokens,
+    raw: usage
+  };
+}
+
+function addUsage(left, right) {
+  return {
+    promptTokens: left.promptTokens + right.promptTokens,
+    candidatesTokens: left.candidatesTokens + right.candidatesTokens,
+    thoughtsTokens: left.thoughtsTokens + right.thoughtsTokens,
+    toolUsePromptTokens: left.toolUsePromptTokens + right.toolUsePromptTokens,
+    cachedContentTokens: left.cachedContentTokens + right.cachedContentTokens,
+    totalTokens: left.totalTokens + right.totalTokens,
+    raw: [...left.raw, right.raw].filter((item) => item && Object.keys(item).length)
+  };
+}
+
+function modelUsage(responses, purpose) {
+  const model = modelName();
+  const empty = {
+    promptTokens: 0,
+    candidatesTokens: 0,
+    thoughtsTokens: 0,
+    toolUsePromptTokens: 0,
+    cachedContentTokens: 0,
+    totalTokens: 0,
+    raw: []
+  };
+  const tokens = responses.filter(Boolean).map(usageFromResponse).reduce(addUsage, empty);
+  const outputTokens = tokens.candidatesTokens + tokens.thoughtsTokens;
+  const fallbackTotal = tokens.promptTokens + outputTokens + tokens.toolUsePromptTokens;
+  const totalTokens = tokens.totalTokens || fallbackTotal;
+  const pricing = modelPricingUsdPerMillionTokens(model);
+  const inputCost =
+    pricing.input == null ? null : ((tokens.promptTokens + tokens.toolUsePromptTokens) / 1_000_000) * pricing.input;
+  const outputCost = pricing.output == null ? null : (outputTokens / 1_000_000) * pricing.output;
+  const estimatedCostUsd =
+    inputCost == null || outputCost == null ? null : Number((inputCost + outputCost).toFixed(8));
+
+  return {
+    purpose,
+    model,
+    tokens: {
+      input: tokens.promptTokens + tokens.toolUsePromptTokens,
+      output: outputTokens,
+      total: totalTokens,
+      prompt: tokens.promptTokens,
+      candidates: tokens.candidatesTokens,
+      thoughts: tokens.thoughtsTokens,
+      toolUsePrompt: tokens.toolUsePromptTokens,
+      cachedContent: tokens.cachedContentTokens
+    },
+    cost: {
+      estimatedUsd: estimatedCostUsd,
+      inputUsd: inputCost == null ? null : Number(inputCost.toFixed(8)),
+      outputUsd: outputCost == null ? null : Number(outputCost.toFixed(8)),
+      pricingUsdPerMillionTokens: {
+        input: pricing.input,
+        output: pricing.output
+      },
+      pricingSource: pricing.source
+    },
+    rawUsageMetadata: tokens.raw
+  };
+}
+
 function maxToolSteps() {
   const raw = process.env.GEMINI_MAX_TOOL_STEPS || "50";
   const n = Number.parseInt(raw, 10);
@@ -346,7 +464,7 @@ function instrumentMcpClient(mcpClient, context) {
   });
 }
 
-export async function runGeminiWithMcp({ message, customerId, jobId, conversationHistory = [], onPhase }) {
+export async function runGeminiWithMcp({ message, finalQuery = "", customerId, jobId, conversationHistory = [], onPhase }) {
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
@@ -407,9 +525,13 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
     "Always include finite date ranges and LIMITs where required.";
   const understanding = requestPolicy(message);
   const conversationContext = formatConversationContext(conversationHistory);
+  const finalQueryText = String(finalQuery || "").trim();
+  const finalQueryContext = finalQueryText
+    ? `Final interpreted query for tool decision:\n${finalQueryText}\n\n`
+    : "";
   const userText = effectiveCustomerId
-    ? `Customer ID: ${effectiveCustomerId}\n\n${conversationContext ? `${conversationContext}\n\n` : ""}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`
-    : `${conversationContext ? `${conversationContext}\n\n` : ""}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`;
+    ? `Customer ID: ${effectiveCustomerId}\n\n${conversationContext ? `${conversationContext}\n\n` : ""}${finalQueryContext}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`
+    : `${conversationContext ? `${conversationContext}\n\n` : ""}${finalQueryContext}Critical query policy for this request:\n${understanding}\n\nUser request:\n${message}`;
 
   const prompt = `${systemPrefix}\n\n${userText}`;
   const toolCalls = [];
@@ -443,9 +565,10 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
   });
 
   let text = extractText(res1);
+  let res2 = null;
   if (!text || !text.trim()) {
     // Sometimes the model completes tool calls but forgets to output a final message.
-    const res2 = await ai.models.generateContent({
+    res2 = await ai.models.generateContent({
       model: modelName(),
       contents:
         prompt +
@@ -458,13 +581,14 @@ export async function runGeminiWithMcp({ message, customerId, jobId, conversatio
   const debugTrace = {
     customerId: effectiveCustomerId || null,
     understanding,
+    finalQuery: finalQueryText || null,
     toolCalls
   };
   const finalText = includeTraceInResponse()
     ? `${text || ""}${formatExecutionTrace(debugTrace)}`
     : text;
 
-  return { text: finalText, debugTrace };
+  return { text: finalText, debugTrace, usage: modelUsage([res1, res2], "answer") };
 }
 
 export async function runGeminiUnderstanding({ message, customerId, conversationHistory = [] }) {
@@ -510,6 +634,7 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
     text:
       text ||
       `I understood your request as: ${message}\nCustomer ID: ${effectiveCustomerId || "not specified"}.`,
-    customerIdUsed: effectiveCustomerId || null
+    customerIdUsed: effectiveCustomerId || null,
+    usage: modelUsage([res], "understanding")
   };
 }

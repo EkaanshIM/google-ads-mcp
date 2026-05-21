@@ -17,6 +17,8 @@
       h1 { font-size: 18px; margin: 0 0 12px; }
       .muted { color:#666; font-size: 12px; }
       .status { margin-top: 10px; font-size: 12px; color:#555; }
+      .interpreted { background:#f7f9fc; color:#1f2937; border:1px solid #e5eaf3; white-space:pre-wrap; }
+      .hidden { display:none; }
     </style>
   </head>
   <body>
@@ -37,6 +39,11 @@
         </div>
       </div>
     </div>
+
+    <section id="interpretedWrap" class="hidden">
+      <h2 style="font-size:14px; margin-top:18px;">Interpreted Query</h2>
+      <pre id="interpreted" class="interpreted"></pre>
+    </section>
 
     <h2 style="font-size:14px; margin-top:18px;">Output</h2>
     <pre id="out">Ready.</pre>
@@ -113,11 +120,36 @@
         }
       }
 
+      function setInterpretedQuery(text) {
+        const wrap = document.getElementById('interpretedWrap');
+        const interpreted = document.getElementById('interpreted');
+        const value = String(text || '').trim();
+        interpreted.textContent = value;
+        wrap.classList.toggle('hidden', !value);
+      }
+
+      async function interpretQuery({ message, customerId, sessionId }) {
+        const response = await fetchJson('/api/chat/understand', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, customerId, sessionId })
+        });
+        if (response?.sessionId) storeSessionId(response.sessionId);
+        const interpretedQuery = response?.understanding || '';
+        setInterpretedQuery(interpretedQuery);
+        return {
+          interpretedQuery,
+          finalQueryDecidedAt: response?.finalQueryDecidedAt || '',
+          interpretationMetadata: response?.metadata || null
+        };
+      }
+
       async function pollJob(jobId) {
         const out = document.getElementById('out');
         try {
           const job = await fetchJson(`/api/chat/${jobId}`);
           if (job?.sessionId) storeSessionId(job.sessionId);
+          setInterpretedQuery(job?.interpretedQuery || job?.result?.interpretedQuery || '');
           const status = job?.status || 'unknown';
           setStatus(`Job ${jobId}: ${status}${job?.sessionId ? ` | Session ${job.sessionId}` : ''}`);
           if (status === 'completed') {
@@ -144,6 +176,7 @@
       async function send() {
         const out = document.getElementById('out');
         stopPolling();
+        setInterpretedQuery('');
         out.textContent = 'Submitting job...';
         setStatus('Creating async job...');
 
@@ -160,12 +193,29 @@
         document.getElementById('customerId').value = customerId;
 
         try {
+          setStatus('Interpreting query...');
+          let interpretedQuery = '';
+          let finalQueryDecidedAt = '';
+          let interpretationMetadata = null;
+          try {
+            const interpreted = await interpretQuery({ message, customerId, sessionId });
+            interpretedQuery = interpreted.interpretedQuery;
+            finalQueryDecidedAt = interpreted.finalQueryDecidedAt;
+            interpretationMetadata = interpreted.interpretationMetadata;
+          } catch (e) {
+            interpretedQuery = `Original request: ${message}`;
+            finalQueryDecidedAt = new Date().toISOString();
+            setInterpretedQuery(interpretedQuery);
+          }
+
+          setStatus('Creating async job...');
           const response = await fetchJson('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message, customerId, sessionId })
+            body: JSON.stringify({ message, customerId, sessionId, interpretedQuery, finalQueryDecidedAt, interpretationMetadata })
           });
           if (response?.sessionId) storeSessionId(response.sessionId);
+          setInterpretedQuery(response?.interpretedQuery || response?.result?.interpretedQuery || interpretedQuery);
           if (response?.status === 'completed') {
             out.textContent = response?.text || response?.result?.text || JSON.stringify(response, null, 2);
             setStatus(`Completed without polling.${response?.sessionId ? ` Session ${response.sessionId}.` : ''}`);

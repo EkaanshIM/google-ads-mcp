@@ -95,6 +95,7 @@ app.post("/api/mcp/call", async (req, res) => {
 });
 
 app.post("/api/chat/understand", async (req, res) => {
+  const userQueryReceivedAt = new Date().toISOString();
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
   const customerId = resolvedCustomerId(requestedCustomerId);
@@ -125,12 +126,25 @@ app.post("/api/chat/understand", async (req, res) => {
       customerId,
       conversationHistory
     });
+    const finalQueryDecidedAt = new Date().toISOString();
+    const metadata = buildUnderstandingMetadata({
+      message,
+      finalQuery: understanding.text,
+      customerIdUsed: understanding.customerIdUsed || customerId,
+      sessionId,
+      userQueryReceivedAt,
+      finalQueryDecidedAt,
+      usage: understanding.usage,
+      conversationTurns: conversationHistory.length
+    });
 
     return res.json({
       status: "ready_for_confirmation",
       sessionId,
       customerIdUsed: understanding.customerIdUsed || customerId,
-      understanding: understanding.text
+      understanding: understanding.text,
+      finalQueryDecidedAt,
+      metadata
     });
   } catch (e) {
     res.status(500).json({ error: e?.message ?? String(e), sessionId });
@@ -138,8 +152,17 @@ app.post("/api/chat/understand", async (req, res) => {
 });
 
 app.post("/api/chat", async (req, res) => {
+  const userQueryReceivedAt = new Date().toISOString();
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   const requestedCustomerId = typeof req.body?.customerId === "string" ? req.body.customerId.trim() : "";
+  const interpretedQuery =
+    typeof req.body?.interpretedQuery === "string" ? req.body.interpretedQuery.trim().slice(0, 4000) : "";
+  const finalQuery = interpretedQuery || message;
+  const finalQueryDecidedAt = sanitizeIsoString(req.body?.finalQueryDecidedAt) || userQueryReceivedAt;
+  const interpretationMetadata =
+    typeof req.body?.interpretationMetadata === "object" && req.body.interpretationMetadata
+      ? req.body.interpretationMetadata
+      : null;
   const customerId = resolvedCustomerId(requestedCustomerId);
   const requestedSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
   const cookieSessionId = parseCookieHeader(req.headers.cookie || "").googleAdsDemoSessionId || "";
@@ -157,11 +180,15 @@ app.post("/api/chat", async (req, res) => {
     status: "queued",
     phase: "backend",
     message,
+    interpretedQuery,
+    finalQuery,
+    finalQueryDecidedAt,
+    interpretationMetadata,
     customerId,
     sessionId,
     conversationHistory,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+    createdAt: userQueryReceivedAt,
+    updatedAt: userQueryReceivedAt
   };
 
   try {
@@ -193,6 +220,8 @@ app.post("/api/chat", async (req, res) => {
       sessionId,
       status: job.status,
       phase: job.phase,
+      interpretedQuery: job.interpretedQuery || "",
+      metadata: buildChatMetadata(job),
       pollUrl: `/api/chat/${jobId}`
     });
   } catch (e) {
@@ -506,16 +535,19 @@ async function runChatJob(job) {
 
   if (isPausedLast24HoursQuestion(job.message)) {
     await updateJob(job.id, { phase: "ads" });
-    return runPausedCampaignFastPath(job.customerId, context);
+    const out = await runPausedCampaignFastPath(job.customerId, context);
+    return { ...out, interpretedQuery: job.interpretedQuery || "" };
   }
 
   if (isProductMultipleCampaignCountQuestion(job.message)) {
     await updateJob(job.id, { phase: "ads" });
-    return runProductMultipleCampaignFastPath(job.customerId, context);
+    const out = await runProductMultipleCampaignFastPath(job.customerId, context);
+    return { ...out, interpretedQuery: job.interpretedQuery || "" };
   }
 
   const out = await runGeminiWithMcp({
     message: job.message,
+    finalQuery: job.finalQuery || job.interpretedQuery || "",
     customerId: job.customerId,
     jobId: job.id,
     conversationHistory: job.conversationHistory || [],
@@ -523,6 +555,7 @@ async function runChatJob(job) {
   });
   return {
     ...out,
+    interpretedQuery: job.interpretedQuery || "",
     customerIdUsed: resolvedCustomerId(job.customerId) || null,
     mode: "gemini"
   };
@@ -588,12 +621,107 @@ function publicErrorMessage(error) {
   return message;
 }
 
+function metadataProjectKey() {
+  return process.env.RESPONSE_METADATA_PROJECT || process.env.PROJECT_NAME || "google-ads-mcp";
+}
+
+function sanitizeIsoString(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function durationMs(startIso, endIso) {
+  const start = new Date(startIso || "").getTime();
+  const end = new Date(endIso || "").getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return Math.max(0, end - start);
+}
+
+function totalTokensConsumed(usages) {
+  return usages.reduce((sum, usage) => {
+    const value = Number(usage?.tokens?.total);
+    return sum + (Number.isFinite(value) ? value : 0);
+  }, 0);
+}
+
+function totalEstimatedCostUsd(usages) {
+  let sawValue = false;
+  const total = usages.reduce((sum, usage) => {
+    const value = Number(usage?.cost?.estimatedUsd);
+    if (!Number.isFinite(value)) return sum;
+    sawValue = true;
+    return sum + value;
+  }, 0);
+  return sawValue ? Number(total.toFixed(8)) : null;
+}
+
+function usageFromSimpleMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object") return null;
+  return {
+    model: metadata.modelName || null,
+    tokens: {
+      total: Number(metadata.totalTokensConsumed || 0)
+    },
+    cost: {
+      estimatedUsd:
+        metadata.estimatedCostUsd == null || !Number.isFinite(Number(metadata.estimatedCostUsd))
+          ? null
+          : Number(metadata.estimatedCostUsd)
+    }
+  };
+}
+
+function buildUnderstandingMetadata({
+  message,
+  finalQuery,
+  userQueryReceivedAt,
+  finalQueryDecidedAt,
+  usage
+}) {
+  return {
+    totalTokensConsumed: Number(usage?.tokens?.total || 0),
+    modelName: usage?.model || null,
+    projectName: metadataProjectKey(),
+    userQuery: message,
+    finalQuery,
+    estimatedCostUsd: usage?.cost?.estimatedUsd ?? null,
+    durationUserInputToFinalQueryMs: durationMs(userQueryReceivedAt, finalQueryDecidedAt),
+    durationFinalQueryToOutputMs: null
+  };
+}
+
+function buildChatMetadata(job, result = null) {
+  const outputDeliveredAt = job.completedAt || (job.status === "completed" || job.status === "failed" ? job.updatedAt : null);
+  const interpretationUsage = usageFromSimpleMetadata(job.interpretationMetadata);
+  const usages = [interpretationUsage, result?.usage].filter(Boolean);
+  return {
+    totalTokensConsumed: totalTokensConsumed(usages),
+    modelName: result?.usage?.model || interpretationUsage?.model || null,
+    projectName: metadataProjectKey(),
+    userQuery: job.message || "",
+    finalQuery: job.finalQuery || job.interpretedQuery || job.message || "",
+    estimatedCostUsd: totalEstimatedCostUsd(usages),
+    durationUserInputToFinalQueryMs: durationMs(job.createdAt, job.finalQueryDecidedAt || job.createdAt),
+    durationFinalQueryToOutputMs: durationMs(job.finalQueryDecidedAt || job.createdAt, outputDeliveredAt)
+  };
+}
+
+function publicResult(result) {
+  if (!result || typeof result !== "object") return result || null;
+  const { usage, metadata, ...rest } = result;
+  return rest;
+}
+
 function serializeChatResponse(job) {
   if (job.status === "completed") {
+    const metadata = buildChatMetadata(job, job.result);
     return {
       status: "completed",
       text: job.result?.text || "",
-      result: job.result || null,
+      result: publicResult(job.result),
+      interpretedQuery: job.result?.interpretedQuery || job.interpretedQuery || "",
+      metadata,
       customerIdUsed: job.result?.customerIdUsed || null,
       mode: job.result?.mode || null,
       sessionId: job.sessionId || null,
@@ -603,9 +731,12 @@ function serializeChatResponse(job) {
   }
 
   if (job.status === "failed") {
+    const metadata = buildChatMetadata(job);
     return {
       status: "failed",
       error: job.error || "Unknown error",
+      interpretedQuery: job.interpretedQuery || "",
+      metadata,
       sessionId: job.sessionId || null,
       jobId: job.id,
       phase: job.phase || "error"
