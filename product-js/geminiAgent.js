@@ -200,6 +200,36 @@ function backendTimeZone() {
   return process.env.GOOGLE_ADS_ACCOUNT_TIME_ZONE || process.env.TZ || "Asia/Kolkata";
 }
 
+function accountDateFromOffset(dayOffset = 0, timeZone = backendTimeZone()) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const year = Number(parts.find((part) => part.type === "year")?.value || "0");
+  const month = Number(parts.find((part) => part.type === "month")?.value || "0");
+  const day = Number(parts.find((part) => part.type === "day")?.value || "0");
+  const baseUtc = Date.UTC(year, Math.max(0, month - 1), Math.max(1, day));
+  return new Date(baseUtc + dayOffset * 86400000).toISOString().slice(0, 10);
+}
+
+function backendRelativeDateContext() {
+  const timeZone = backendTimeZone();
+  const today = accountDateFromOffset(0, timeZone);
+  const yesterday = accountDateFromOffset(-1, timeZone);
+  const sevenDayBaselineStart = accountDateFromOffset(-8, timeZone);
+  const sevenDayBaselineEnd = accountDateFromOffset(-2, timeZone);
+  return {
+    timeZone,
+    today,
+    yesterday,
+    sevenDayBaselineStart,
+    sevenDayBaselineEnd
+  };
+}
+
 function formatConversationContext(history = []) {
   if (!Array.isArray(history) || !history.length) return "";
 
@@ -468,6 +498,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
   const ai = createGenAiClient();
 
   const nowIso = new Date().toISOString();
+  const relativeDates = backendRelativeDateContext();
   const effectiveCustomerId = customerId || defaultCustomerId();
   const customerInstruction = effectiveCustomerId
     ? `Backend-provided Google Ads customer_id: ${effectiveCustomerId}. Never ask the user for a customer ID when this value is present. Use this exact value for any tool call that requires customer_id unless the user explicitly asks for a different account. `
@@ -499,6 +530,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "For campaign status questions, interpret running, active, live, currently running, or enabled campaigns as campaign.status = 'ENABLED'. Do not include PAUSED or REMOVED campaigns in a running/active/live count unless the user explicitly asks for paused, inactive, all statuses, or a status breakdown. " +
     "For simple campaign counts, use count_rows on the campaign resource with field campaign.id and the appropriate status condition instead of fetching every campaign row. " +
     "For broad listing questions, request only the fields needed, always use a LIMIT, and summarize instead of returning huge raw result sets. If the user asks for all rows and the result may be large, ask them to narrow the request or provide a small sample with the total count. " +
+    "When a user requests ad group, keyword, or search-term breakdowns across many campaigns and the dataset may be large, ask for one specific campaign before running deep breakdown queries. If the user still wants all campaigns, return top 5 performing campaigns first, then ask which campaign to drill into. " +
     "When a request requires calculations, comparisons, deltas, averages, rankings, totals, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
     "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
     "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Present money as INR even if customer.currency_code is missing or unexpected. " +
@@ -511,6 +543,9 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "For boost/business-growth questions, call campaign_growth_decision_brief and return concrete actions: exact search terms to scale or negative, bid/CPC range or budget lift percentage, expected incremental conversion formula/range, risk guardrail, and monitoring rule. Do not answer that a stable campaign has nothing to do; stable performance should lead to a controlled scale test when CPA and conversion volume support it. " +
     "Recommended structure for campaign diagnostics: Executive read, What improved, What declined, Specific drivers, Dead-click/wasted-spend opportunities, Working keywords/search terms/products to scale, Action plan with how/why/expected impact, and Monitoring checklist. Omit sections only when they truly do not apply. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
+    `Resolve account-local relative dates using backend timezone ${relativeDates.timeZone}: today=${relativeDates.today}, yesterday=${relativeDates.yesterday}. ` +
+    `For default 7-day-average comparisons, use target day ${relativeDates.yesterday} and baseline ${relativeDates.sevenDayBaselineStart} to ${relativeDates.sevenDayBaselineEnd} unless the user specifies otherwise. ` +
+    "Do not silently shift 'yesterday' to an earlier date. If inherited context changes scope, state the final date range explicitly. " +
     "If account time zone matters, query customer.time_zone or use the backend account time zone supplied below, and mention the exact date range used. " +
     "For questions comparing a period to a 7-day average, define the target period explicitly. If the user does not name the target period, use yesterday as the target day and the seven complete days immediately before yesterday as the baseline. " +
     "For campaign-level 7-day-average comparisons, query all relevant campaigns with campaign.id, campaign.name, segments.date, and the requested metric over the combined target-plus-baseline date range; do not pre-limit to only top campaigns unless the user asks for top campaigns. " +
@@ -518,7 +553,8 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "Before answering ranking questions, self-check that the row you call 'largest' has the greatest absolute change among the rows you report, and separately mention the largest increase and largest decrease when they differ. " +
     "When querying data, prefer using get_resource_metadata before search to avoid guessing fields. " +
     customerInstruction +
-    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${backendTimeZone()}. ` +
+    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${relativeDates.timeZone}. ` +
+    `Backend date anchors: today=${relativeDates.today}, yesterday=${relativeDates.yesterday}, prior-7-days-before-yesterday=${relativeDates.sevenDayBaselineStart}..${relativeDates.sevenDayBaselineEnd}. ` +
     "If the user asks for the last 24 hours, use a finite GAQL range like DURING LAST_1_DAYS. " +
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
@@ -594,6 +630,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
 export async function runGeminiUnderstanding({ message, customerId, conversationHistory = [] }) {
   const ai = createGenAiClient();
   const nowIso = new Date().toISOString();
+  const relativeDates = backendRelativeDateContext();
   const effectiveCustomerId = customerId || defaultCustomerId();
   const conversationContext = formatConversationContext(conversationHistory);
   const prompt = [
@@ -603,10 +640,13 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
     "Do not answer the data question and do not invent metrics. Only restate what will be processed if the user confirms.",
     "If the user asks a clear request like 'show me yesterday campaign spend', do not ask for clarification. Frame it clearly.",
     "If context is inherited, mention the inherited item in plain language, for example: 'I will use yesterday from your previous question.'",
+    "When the user says 'yesterday' or 'today', resolve it from the backend account-local date anchors below and mention the resolved date.",
+    "If the user asks high-volume cross-campaign breakdowns (ad groups/keywords/search terms across all campaigns), ask for one campaign first, or offer top 5 campaigns for narrowing.",
     "If the request is truly ambiguous even after using context, state the missing detail in one short sentence.",
     "Return only the confirmation text, in 2-4 short lines.",
     "",
-    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${backendTimeZone()}.`,
+    `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${relativeDates.timeZone}.`,
+    `Resolved account-local dates: today=${relativeDates.today}, yesterday=${relativeDates.yesterday}, 7-day baseline before yesterday=${relativeDates.sevenDayBaselineStart}..${relativeDates.sevenDayBaselineEnd}.`,
     effectiveCustomerId ? `Customer ID to use: ${effectiveCustomerId}.` : "",
     conversationContext ? `${conversationContext}` : "Recent conversation context: none.",
     "",

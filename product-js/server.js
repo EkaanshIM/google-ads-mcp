@@ -239,6 +239,25 @@ function resolvedCustomerId(customerId) {
   return customerId || defaultCustomerId();
 }
 
+function backendTimeZone() {
+  return process.env.GOOGLE_ADS_ACCOUNT_TIME_ZONE || process.env.TZ || "Asia/Kolkata";
+}
+
+function accountDateFromOffset(dayOffset = 0, timeZone = backendTimeZone()) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const year = Number(parts.find((part) => part.type === "year")?.value || "0");
+  const month = Number(parts.find((part) => part.type === "month")?.value || "0");
+  const day = Number(parts.find((part) => part.type === "day")?.value || "0");
+  const baseUtc = Date.UTC(year, Math.max(0, month - 1), Math.max(1, day));
+  return new Date(baseUtc + dayOffset * 86400000).toISOString().slice(0, 10);
+}
+
 function jobFilePath(jobId) {
   return path.join(chatJobsDir, `${jobId}.json`);
 }
@@ -364,6 +383,78 @@ function isProductMultipleCampaignCountQuestion(message) {
   return mentionsProduct && mentionsCampaign && asksForCount && mentionsOverlap;
 }
 
+function isAllCampaignScopeRequest(message) {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("all campaign") ||
+    normalized.includes("across campaign") ||
+    normalized.includes("across all campaign") ||
+    normalized.includes("entire campaign")
+  );
+}
+
+function isHighVolumeBreakdownQuestion(message) {
+  const normalized = String(message || "").toLowerCase();
+  const asksDeepBreakdown =
+    normalized.includes("ad group") ||
+    normalized.includes("adgroup") ||
+    normalized.includes("keyword") ||
+    normalized.includes("search term");
+  const asksCountOrList =
+    normalized.includes("how many") ||
+    normalized.includes("list") ||
+    normalized.includes("show") ||
+    normalized.includes("more than") ||
+    normalized.includes("cost/conversion") ||
+    normalized.includes("cost per conversion");
+  return asksDeepBreakdown && asksCountOrList;
+}
+
+function hasSpecificCampaignScope(message) {
+  const text = String(message || "");
+  const normalized = text.toLowerCase();
+  const hasQuotedCampaign = /campaign\s*["“][^"”\n]{2,120}["”]/i.test(text);
+  const hasCampaignId = /campaign[^0-9]{0,20}\b\d{5,}\b/i.test(text);
+  const hasNamedCampaign =
+    /in\s+the\s+campaign\s+[a-z0-9][a-z0-9&/().,\- ]{2,120}/i.test(text) &&
+    !normalized.includes("all campaign") &&
+    !normalized.includes("across campaign");
+  return hasQuotedCampaign || hasCampaignId || hasNamedCampaign;
+}
+
+function extractCampaignNamesFromText(text = "") {
+  const results = [];
+  const seen = new Set();
+  const patterns = [
+    /campaign\s*["“]([^"”\n]{3,120})["”]/gi,
+    /\bIMAP[_A-Za-z0-9&/().,\- ]{4,120}\b/g
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const value = String(match[1] || match[0] || "").trim().replace(/\s+/g, " ");
+      if (!value) continue;
+      const key = value.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push(value);
+      if (results.length >= 12) return results;
+    }
+  }
+
+  return results;
+}
+
+function recentCampaignCandidates(conversationHistory = [], limit = 5) {
+  if (!Array.isArray(conversationHistory) || !conversationHistory.length) return [];
+  const merged = conversationHistory
+    .slice(-12)
+    .map((turn) => String(turn?.text || ""))
+    .join("\n");
+  return extractCampaignNamesFromText(merged).slice(0, limit);
+}
+
 function parseMcpToolResult(toolOut) {
   if (Array.isArray(toolOut?.content)) {
     for (const item of toolOut.content) {
@@ -438,6 +529,112 @@ async function runProductMultipleCampaignFastPath(customerId, context = {}) {
     mode: "fast-path",
     result
   };
+}
+
+function formatInr(amount) {
+  const value = Number(amount);
+  if (!Number.isFinite(value)) return "INR 0";
+  return `INR ${value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function runTopCampaignPreviewFastPath(customerId, context = {}) {
+  const cid = resolvedCustomerId(customerId);
+  const dateEnd = accountDateFromOffset(-1);
+  const dateStart = accountDateFromOffset(-7);
+  const mcp = await getMcpClient();
+  const toolRequest = {
+    name: "rank_campaigns",
+    arguments: {
+      customer_id: cid,
+      date_start: dateStart,
+      date_end: dateEnd,
+      metric: "performance",
+      scoring_mode: "balanced",
+      top_n: 5,
+      status: "ENABLED"
+    }
+  };
+
+  await logDebugEvent("server.fast_path_mcp_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments
+  });
+  const toolOut = await mcp.callTool({
+    name: toolRequest.name,
+    arguments: toolRequest.arguments
+  });
+  const result = parseMcpToolResult(toolOut);
+  await logDebugEvent("server.fast_path_mcp_result", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    result: summarizeMcpResult(result)
+  });
+
+  if (!result || typeof result !== "object" || !Array.isArray(result.best)) {
+    return {
+      text:
+        "This looks like a high-volume cross-campaign breakdown. Please pick one campaign name or ID first and I will run the detailed ad group analysis.",
+      customerIdUsed: cid,
+      mode: "fast-path",
+      result
+    };
+  }
+
+  const topRows = result.best.slice(0, 5);
+  if (!topRows.length) {
+    return {
+      text: `I could not find enabled campaigns in ${dateStart} to ${dateEnd}. Share one campaign name or ID, or a different date range, and I will run the ad-group level breakdown.`,
+      customerIdUsed: cid,
+      mode: "fast-path",
+      result
+    };
+  }
+
+  const lines = [
+    `Your request is large across all campaigns. To keep results reliable, please choose one campaign first.`,
+    `Top 5 performing enabled campaigns for ${dateStart} to ${dateEnd}:`
+  ];
+
+  topRows.forEach((row, index) => {
+    const conversions = Number(row?.conversions || 0);
+    const cost = Number(row?.cost_micros || 0) / 1_000_000;
+    lines.push(
+      `${index + 1}. ${row?.campaign_name || `Campaign ${row?.campaign_id || ""}`}` +
+      ` (Conversions: ${conversions.toLocaleString("en-IN", { maximumFractionDigits: 2 })}, Spend: ${formatInr(cost)})`
+    );
+  });
+
+  lines.push(
+    "",
+    "Reply with one campaign name/ID from this list, and I will run the detailed ad-group query for that campaign."
+  );
+
+  return {
+    text: lines.join("\n"),
+    customerIdUsed: cid,
+    mode: "fast-path",
+    result: {
+      date_start: dateStart,
+      date_end: dateEnd,
+      top_campaigns: topRows
+    }
+  };
+}
+
+function buildNarrowScopePrompt(job) {
+  const options = recentCampaignCandidates(job?.conversationHistory || [], 5);
+  const lines = [
+    "This request can generate very large cross-campaign ad-group data and may fail due to limits.",
+    "Please share one campaign name or campaign ID so I can run an accurate detailed breakdown."
+  ];
+  if (options.length) {
+    lines.push("", "I can use one of these recently discussed campaigns:");
+    options.forEach((name, index) => lines.push(`${index + 1}. ${name}`));
+  }
+  lines.push("", "If you want me to start broad, ask: 'show top 5 performing campaigns first'.");
+  return lines.join("\n");
 }
 
 async function runPausedCampaignFastPath(customerId, context = {}) {
@@ -533,6 +730,20 @@ async function runChatJob(job) {
     userMessage: job.message
   };
 
+  if (isHighVolumeBreakdownQuestion(job.message) && !hasSpecificCampaignScope(job.message)) {
+    if (isAllCampaignScopeRequest(job.message)) {
+      await updateJob(job.id, { phase: "ads" });
+      const out = await runTopCampaignPreviewFastPath(job.customerId, context);
+      return { ...out, interpretedQuery: job.interpretedQuery || "" };
+    }
+    return {
+      text: buildNarrowScopePrompt(job),
+      customerIdUsed: resolvedCustomerId(job.customerId) || null,
+      mode: "fast-path",
+      interpretedQuery: job.interpretedQuery || ""
+    };
+  }
+
   if (isPausedLast24HoursQuestion(job.message)) {
     await updateJob(job.id, { phase: "ads" });
     const out = await runPausedCampaignFastPath(job.customerId, context);
@@ -583,30 +794,49 @@ async function queueChatJob(job) {
       textPreview: String(result?.text || "").slice(0, 4000)
     });
   } catch (e) {
+    const publicMessage = publicErrorMessage(e, job);
     await updateJob(job.id, {
       status: "failed",
       phase: "error",
       completedAt: new Date().toISOString(),
-      error: publicErrorMessage(e)
+      error: publicMessage
     });
     await appendSessionTurns(job.sessionId, [
       { role: "user", text: job.message, at: job.createdAt },
-      { role: "assistant", text: `Request failed: ${publicErrorMessage(e)}`, at: new Date().toISOString() }
+      { role: "assistant", text: `Request failed: ${publicMessage}`, at: new Date().toISOString() }
     ]);
     await logDebugEvent("chat_job.failed", {
       jobId: job.id,
       sessionId: job.sessionId,
       customerId: job.customerId,
-      error: publicErrorMessage(e)
+      error: publicMessage
     });
   } finally {
     activeJobPromises.delete(job.id);
   }
 }
 
-function publicErrorMessage(error) {
+function publicErrorMessage(error, job = null) {
   const message = error?.message ?? String(error);
   const lower = message.toLowerCase();
+  if (
+    lower.includes("resource exhausted") ||
+    lower.includes("resource_exhausted") ||
+    lower.includes("code\":429") ||
+    lower.includes("quota") ||
+    lower.includes("rate limit")
+  ) {
+    const campaigns = recentCampaignCandidates(job?.conversationHistory || [], 5);
+    const campaignLine = campaigns.length
+      ? ` Recently discussed campaigns: ${campaigns.join(", ")}.`
+      : "";
+    return [
+      "The request hit a temporary processing limit (429 / RESOURCE_EXHAUSTED).",
+      "Please narrow scope to one campaign and a finite date range, or ask for top 5 performing campaigns first.",
+      "Example: 'For campaign <name>, show ad groups with cost per conversion > 500 in last 7 days.'",
+      campaignLine
+    ].join(" ").trim();
+  }
   if (
     lower.includes("input token count") ||
     lower.includes("maximum number of tokens") ||
