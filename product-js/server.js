@@ -422,6 +422,37 @@ function hasSpecificCampaignScope(message) {
   return hasQuotedCampaign || hasCampaignId || hasNamedCampaign;
 }
 
+function parseAdGroupCpaThresholdQuestion(message) {
+  const text = String(message || "");
+  const normalized = text.toLowerCase();
+  const mentionsAdGroup = normalized.includes("ad group") || normalized.includes("adgroup");
+  const mentionsCpa =
+    normalized.includes("cost/conversion") ||
+    normalized.includes("cost per conversion") ||
+    normalized.includes("cpa");
+  const asksCount = normalized.includes("how many") || normalized.includes("count") || normalized.includes("number");
+  const mentionsLast7 = normalized.includes("last 7") || normalized.includes("7 day") || normalized.includes("7day");
+
+  if (!(mentionsAdGroup && mentionsCpa && asksCount)) return null;
+
+  const thresholdMatch = text.match(
+    /(?:more than|greater than|above|over|exceed(?:ed|s)?|>|>=)\s*(?:inr|rs\.?|rupees?)?\s*([0-9]+(?:\.[0-9]+)?)/i
+  );
+  const thresholdInr = thresholdMatch ? Number(thresholdMatch[1]) : 500;
+  if (!Number.isFinite(thresholdInr) || thresholdInr < 0) return null;
+
+  const quotedCampaign = text.match(/campaign\s*["“]([^"”\n]{2,160})["”]/i)?.[1]?.trim();
+  const unquotedCampaign = text.match(/in\s+the\s+campaign\s+([^,\n.]{2,160})/i)?.[1]?.trim();
+  const campaignName = quotedCampaign || unquotedCampaign || "";
+  if (!campaignName) return null;
+
+  return {
+    campaignName,
+    thresholdInr,
+    useLast7CompleteDays: true
+  };
+}
+
 function extractCampaignNamesFromText(text = "") {
   const results = [];
   const seen = new Set();
@@ -637,6 +668,132 @@ function buildNarrowScopePrompt(job) {
   return lines.join("\n");
 }
 
+function escapeGaqlString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatNumber(value, maxFractionDigits = 2) {
+  return Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: maxFractionDigits });
+}
+
+async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) {
+  const cid = resolvedCustomerId(customerId);
+  const thresholdInr = Number(params?.thresholdInr || 500);
+  const campaignName = String(params?.campaignName || "").trim();
+  const dateEnd = accountDateFromOffset(-1);
+  const dateStart = accountDateFromOffset(-7);
+  const mcp = await getMcpClient();
+
+  const fields = [
+    "campaign.name",
+    "campaign.status",
+    "ad_group.id",
+    "ad_group.name",
+    "ad_group.status",
+    "metrics.cost_micros",
+    "metrics.conversions"
+  ];
+
+  const conditions = [
+    `campaign.name = '${escapeGaqlString(campaignName)}'`,
+    "campaign.status = 'ENABLED'",
+    "ad_group.status = 'ENABLED'",
+    "metrics.conversions > 0",
+    `segments.date >= '${dateStart}'`,
+    `segments.date <= '${dateEnd}'`
+  ];
+
+  const toolRequest = {
+    name: "search",
+    arguments: {
+      customer_id: cid,
+      resource: "ad_group",
+      fields,
+      conditions,
+      orderings: ["metrics.cost_micros DESC"],
+      limit: 10000
+    }
+  };
+
+  await logDebugEvent("server.fast_path_mcp_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments
+  });
+  const toolOut = await mcp.callTool({
+    name: toolRequest.name,
+    arguments: toolRequest.arguments
+  });
+  const rows = parseMcpToolResult(toolOut);
+  await logDebugEvent("server.fast_path_mcp_result", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    result: summarizeMcpResult(rows)
+  });
+
+  const data = Array.isArray(rows) ? rows : [];
+  const qualifying = data
+    .map((row) => {
+      const adGroupName = String(row?.["ad_group.name"] || "").trim();
+      const conversions = toFiniteNumber(row?.["metrics.conversions"]);
+      const costMicros = toFiniteNumber(row?.["metrics.cost_micros"]);
+      if (!adGroupName || conversions <= 0 || costMicros <= 0) return null;
+      const cpaInr = costMicros / 1_000_000 / conversions;
+      return {
+        adGroupName,
+        conversions,
+        cpaInr
+      };
+    })
+    .filter((item) => item && item.cpaInr > thresholdInr)
+    .sort((a, b) => b.cpaInr - a.cpaInr);
+
+  const count = qualifying.length;
+  const sample = qualifying.slice(0, 25);
+  const lines = [
+    `For customer ${cid}, campaign "${campaignName}", in the last 7 complete days (${dateStart} to ${dateEnd}), ${count} ad group(s) had cost per conversion above INR ${formatNumber(thresholdInr)}.`,
+  ];
+
+  if (!count) {
+    lines.push("", "No qualifying ad groups were found with conversions > 0 in this range.");
+  } else {
+    lines.push("", "| Ad Group | Conversions | Cost / Conversion (INR) |", "| --- | ---: | ---: |");
+    sample.forEach((item) => {
+      lines.push(
+        `| ${item.adGroupName} | ${formatNumber(item.conversions)} | ${formatNumber(item.cpaInr)} |`
+      );
+    });
+    if (count > sample.length) {
+      lines.push("", `Showing top ${sample.length} by highest cost per conversion.`);
+    }
+  }
+
+  lines.push(
+    "",
+    "Formula used: cost_per_conversion = metrics.cost_micros / 1,000,000 / metrics.conversions."
+  );
+
+  return {
+    text: lines.join("\n"),
+    customerIdUsed: cid,
+    mode: "fast-path",
+    result: {
+      campaign_name: campaignName,
+      threshold_inr: thresholdInr,
+      date_start: dateStart,
+      date_end: dateEnd,
+      count,
+      rows: qualifying
+    }
+  };
+}
+
 async function runPausedCampaignFastPath(customerId, context = {}) {
   const cid = resolvedCustomerId(customerId);
   if (!cid) {
@@ -729,6 +886,13 @@ async function runChatJob(job) {
     sessionId: job.sessionId,
     userMessage: job.message
   };
+
+  const adGroupCpaQuestion = parseAdGroupCpaThresholdQuestion(job.message);
+  if (adGroupCpaQuestion) {
+    await updateJob(job.id, { phase: "ads" });
+    const out = await runAdGroupCpaThresholdFastPath(job.customerId, adGroupCpaQuestion, context);
+    return { ...out, interpretedQuery: job.interpretedQuery || "" };
+  }
 
   if (isHighVolumeBreakdownQuestion(job.message) && !hasSpecificCampaignScope(job.message)) {
     if (isAllCampaignScopeRequest(job.message)) {
