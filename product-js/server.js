@@ -258,6 +258,76 @@ function accountDateFromOffset(dayOffset = 0, timeZone = backendTimeZone()) {
   return new Date(baseUtc + dayOffset * 86400000).toISOString().slice(0, 10);
 }
 
+function accountCurrentYear(timeZone = backendTimeZone()) {
+  return Number(accountDateFromOffset(0, timeZone).slice(0, 4));
+}
+
+function parseMonthNameToken(token = "") {
+  const normalized = String(token || "").trim().toLowerCase().slice(0, 3);
+  const monthMap = {
+    jan: 1,
+    feb: 2,
+    mar: 3,
+    apr: 4,
+    may: 5,
+    jun: 6,
+    jul: 7,
+    aug: 8,
+    sep: 9,
+    oct: 10,
+    nov: 11,
+    dec: 12
+  };
+  return monthMap[normalized] || 0;
+}
+
+function toIsoDate(year, month, day) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return "";
+  if (m < 1 || m > 12 || d < 1 || d > 31) return "";
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+function parseExplicitDateRange(message, timeZone = backendTimeZone()) {
+  const text = String(message || "");
+  const currentYear = accountCurrentYear(timeZone);
+
+  const isoRangeMatch = text.match(
+    /\b(20\d{2}-\d{2}-\d{2})\s*(?:to|through|thru|-)\s*(20\d{2}-\d{2}-\d{2})\b/i
+  );
+  if (isoRangeMatch) {
+    return { dateStart: isoRangeMatch[1], dateEnd: isoRangeMatch[2], source: "explicit_range" };
+  }
+
+  const namedRangeMatch = text.match(
+    /\b(\d{1,2})\s*([a-zA-Z]{3,9})(?:\s*(20\d{2}))?\s*(?:to|through|thru|-)\s*(\d{1,2})\s*([a-zA-Z]{3,9})(?:\s*(20\d{2}))?\b/i
+  );
+  if (namedRangeMatch) {
+    const startMonth = parseMonthNameToken(namedRangeMatch[2]);
+    const endMonth = parseMonthNameToken(namedRangeMatch[5]);
+    const startYear = Number(namedRangeMatch[3] || namedRangeMatch[6] || currentYear);
+    const endYear = Number(namedRangeMatch[6] || namedRangeMatch[3] || startYear);
+    const dateStart = toIsoDate(startYear, startMonth, Number(namedRangeMatch[1]));
+    const dateEnd = toIsoDate(endYear, endMonth, Number(namedRangeMatch[4]));
+    if (dateStart && dateEnd) {
+      return { dateStart, dateEnd, source: "explicit_range" };
+    }
+  }
+
+  return null;
+}
+
+function normalizeCampaignNameForMatch(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\bads\b/g, " ads ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function jobFilePath(jobId) {
   return path.join(chatJobsDir, `${jobId}.json`);
 }
@@ -455,15 +525,20 @@ function parseAdGroupCpaThresholdQuestion(message) {
 
   const quotedCampaign = text.match(/campaign\s*["“]([^"”\n]{2,160})["”]/i)?.[1]?.trim();
   const unquotedCampaign = text.match(/in\s+the\s+campaign\s+([^,\n.]{2,160})/i)?.[1]?.trim();
-  const bareCampaignBeforeAds = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?)\s+ads\b/i)?.[1]?.trim();
+  const bareCampaignWithAds = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?\s+ads)\b/i)?.[1]?.trim();
   const bareCampaignBeforeHave = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?)\s+have\b/i)?.[1]?.trim();
-  const campaignName = quotedCampaign || unquotedCampaign || bareCampaignBeforeAds || bareCampaignBeforeHave || "";
+  const campaignName = quotedCampaign || unquotedCampaign || bareCampaignWithAds || bareCampaignBeforeHave || "";
   if (!campaignName) return null;
+
+  const explicitRange = parseExplicitDateRange(text);
 
   return {
     campaignName,
     thresholdInr,
-    useLast7CompleteDays: true
+    useLast7CompleteDays: mentionsLast7,
+    dateStart: explicitRange?.dateStart || "",
+    dateEnd: explicitRange?.dateEnd || "",
+    dateSource: explicitRange?.source || ""
   };
 }
 
@@ -512,6 +587,56 @@ function parseMcpToolResult(toolOut) {
     }
   }
   return toolOut;
+}
+
+async function resolveCampaignNameForAccount(customerId, requestedCampaignName, context = {}) {
+  const requested = String(requestedCampaignName || "").trim();
+  if (!requested) return "";
+
+  const cid = resolvedCustomerId(customerId);
+  const mcp = await getMcpClient();
+  const toolRequest = {
+    name: "search",
+    arguments: {
+      customer_id: cid,
+      resource: "campaign",
+      fields: ["campaign.id", "campaign.name", "campaign.status"],
+      conditions: ["campaign.status = 'ENABLED'"],
+      limit: 5000
+    }
+  };
+
+  await logDebugEvent("server.campaign_name_resolution_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    requestedCampaignName: requested
+  });
+  const toolOut = await mcp.callTool(toolRequest);
+  const rows = parseMcpToolResult(toolOut);
+  const campaigns = Array.isArray(rows) ? rows : [];
+  const requestedNormalized = normalizeCampaignNameForMatch(requested);
+  const requestedTokens = requestedNormalized.split(" ").filter(Boolean);
+
+  const scored = campaigns
+    .map((row) => {
+      const name = String(row?.["campaign.name"] || "").trim();
+      const normalized = normalizeCampaignNameForMatch(name);
+      const tokensMatched = requestedTokens.filter((token) => normalized.includes(token)).length;
+      const exact = normalized === requestedNormalized;
+      const contains = normalized.includes(requestedNormalized) || requestedNormalized.includes(normalized);
+      return { name, normalized, exact, contains, tokensMatched };
+    })
+    .filter((item) => item.name && item.tokensMatched > 0)
+    .sort((a, b) => {
+      if (a.exact !== b.exact) return a.exact ? -1 : 1;
+      if (a.contains !== b.contains) return a.contains ? -1 : 1;
+      if (a.tokensMatched !== b.tokensMatched) return b.tokensMatched - a.tokensMatched;
+      return a.name.length - b.name.length;
+    });
+
+  const best = scored[0];
+  return best?.name || requested;
 }
 
 async function runProductMultipleCampaignFastPath(customerId, context = {}) {
@@ -723,9 +848,11 @@ function parseConversionsVs7dQuery(message) {
 async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) {
   const cid = resolvedCustomerId(customerId);
   const thresholdInr = Number(params?.thresholdInr || 500);
-  const campaignName = String(params?.campaignName || "").trim();
-  const dateEnd = accountDateFromOffset(-1);
-  const dateStart = accountDateFromOffset(-7);
+  const requestedCampaignName = String(params?.campaignName || "").trim();
+  const campaignName = await resolveCampaignNameForAccount(cid, requestedCampaignName, context);
+  const dateEnd = String(params?.dateEnd || "").trim() || accountDateFromOffset(-1);
+  const dateStart = String(params?.dateStart || "").trim() || accountDateFromOffset(-7);
+  const usedExplicitRange = Boolean(params?.dateStart && params?.dateEnd);
   const mcp = await getMcpClient();
 
   const fields = [
@@ -734,6 +861,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "ad_group.id",
     "ad_group.name",
     "ad_group.status",
+    "ad_group.primary_status",
     "metrics.clicks",
     "metrics.impressions",
     "metrics.cost_micros",
@@ -796,11 +924,11 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     };
     const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
     const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
-    const cpaDirect = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
+    const cpaDirectMicros = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
     prev.conversions += conversions;
     prev.costMicros += costMicros;
-    if (cpaDirect > 0) {
-      prev.cpaDirectSum += cpaDirect;
+    if (cpaDirectMicros > 0) {
+      prev.cpaDirectSum += cpaDirectMicros / 1_000_000;
       prev.cpaDirectCount += 1;
     }
     byAdGroup.set(id, prev);
@@ -825,7 +953,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   const count = qualifying.length;
   const sample = qualifying.slice(0, 25);
   const lines = [
-    `For customer ${cid}, campaign "${campaignName}", in the last 7 complete days (${dateStart} to ${dateEnd}), ${count} ad group(s) had cost per conversion above INR ${formatNumber(thresholdInr)}.`,
+    `For customer ${cid}, campaign "${campaignName}", in ${usedExplicitRange ? "the requested range" : "the last 7 complete days"} (${dateStart} to ${dateEnd}), ${count} ad group(s) had cost per conversion above INR ${formatNumber(thresholdInr)}.`,
   ];
 
   if (!count) {
