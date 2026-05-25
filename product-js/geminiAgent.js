@@ -281,6 +281,64 @@ function enforceAccountLevelUnderstandingText(text = "", message = "", customerI
   return out;
 }
 
+function isDeclineReasonIntent(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  const asksReason =
+    normalized.includes("why") ||
+    normalized.includes("reason") ||
+    normalized.includes("what led") ||
+    normalized.includes("what caused") ||
+    normalized.includes("root cause");
+  const mentionsDrop =
+    normalized.includes("decline") ||
+    normalized.includes("drop") ||
+    normalized.includes("decrease") ||
+    normalized.includes("down");
+  return asksReason && mentionsDrop;
+}
+
+function hasPrematureLimitationText(text = "") {
+  const normalized = String(text || "").toLowerCase();
+  return (
+    normalized.includes("cannot pinpoint") ||
+    normalized.includes("technical limitation") ||
+    normalized.includes("lack access") ||
+    normalized.includes("cannot determine the exact") ||
+    normalized.includes("i can't determine the exact") ||
+    normalized.includes("confirm before i process")
+  );
+}
+
+function deterministicUnderstandingFallback(message = "", customerId = "", relativeDates = null) {
+  const normalized = String(message || "").toLowerCase();
+  const cidText = customerId ? ` for customer ${customerId}` : "";
+
+  if (isDeclineReasonIntent(normalized)) {
+    const baselineStart = relativeDates?.sevenDayBaselineStart || "";
+    const baselineEnd = relativeDates?.sevenDayBaselineEnd || "";
+    const targetDate = relativeDates?.yesterday || "";
+    return [
+      `I will analyze the decline drivers${cidText} using account performance data.`,
+      targetDate && baselineStart && baselineEnd
+        ? `I will compare ${targetDate} against the prior 7-day baseline (${baselineStart} to ${baselineEnd}) and identify the largest negative contributors.`
+        : "I will compare the target period against the prior baseline and identify the largest negative contributors.",
+      "I will return concrete entities and metrics (campaigns/ad groups/search terms/products), not generic possible reasons."
+    ].join("\n");
+  }
+
+  if (normalized.includes("conversion") || normalized.includes("conversions")) {
+    return `I will fetch the requested conversion metrics${cidText} using the exact date scope in your query.`;
+  }
+
+  return `I will process this request${cidText} using Google Ads data and return concrete, metric-backed findings.`;
+}
+
+function enforceConcreteUnderstandingText(text = "", message = "", customerId = "", relativeDates = null) {
+  const current = String(text || "").trim();
+  if (!hasPrematureLimitationText(current)) return current;
+  return deterministicUnderstandingFallback(message, customerId, relativeDates);
+}
+
 function formatConversationContext(history = []) {
   if (!Array.isArray(history) || !history.length) return "";
 
@@ -722,7 +780,13 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
     }
   });
   const rawText = extractText(res).trim();
-  const text = enforceAccountLevelUnderstandingText(rawText, message, effectiveCustomerId);
+  const accountScopedText = enforceAccountLevelUnderstandingText(rawText, message, effectiveCustomerId);
+  const text = enforceConcreteUnderstandingText(
+    accountScopedText,
+    message,
+    effectiveCustomerId,
+    relativeDates
+  );
   return {
     text:
       text ||
