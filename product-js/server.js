@@ -397,6 +397,9 @@ function isHighVolumeBreakdownQuestion(message) {
   const normalized = String(message || "").toLowerCase();
   const asksDeepBreakdown =
     normalized.includes("ad group") ||
+    normalized.includes("ads group") ||
+    normalized.includes("ad groups") ||
+    normalized.includes("ads groups") ||
     normalized.includes("adgroup") ||
     normalized.includes("keyword") ||
     normalized.includes("search term");
@@ -419,13 +422,22 @@ function hasSpecificCampaignScope(message) {
     /in\s+the\s+campaign\s+[a-z0-9][a-z0-9&/().,\- ]{2,120}/i.test(text) &&
     !normalized.includes("all campaign") &&
     !normalized.includes("across campaign");
-  return hasQuotedCampaign || hasCampaignId || hasNamedCampaign;
+  const hasBareNamedCampaign =
+    /in\s+[a-z0-9][a-z0-9&/().,\- ]{2,120}\s+(?:campaign|ads)\b/i.test(text) &&
+    !normalized.includes("all campaign") &&
+    !normalized.includes("across campaign");
+  return hasQuotedCampaign || hasCampaignId || hasNamedCampaign || hasBareNamedCampaign;
 }
 
 function parseAdGroupCpaThresholdQuestion(message) {
   const text = String(message || "");
   const normalized = text.toLowerCase();
-  const mentionsAdGroup = normalized.includes("ad group") || normalized.includes("adgroup");
+  const mentionsAdGroup =
+    normalized.includes("ad group") ||
+    normalized.includes("ads group") ||
+    normalized.includes("ad groups") ||
+    normalized.includes("ads groups") ||
+    normalized.includes("adgroup");
   const mentionsCpa =
     normalized.includes("cost/conversion") ||
     normalized.includes("cost per conversion") ||
@@ -443,7 +455,9 @@ function parseAdGroupCpaThresholdQuestion(message) {
 
   const quotedCampaign = text.match(/campaign\s*["“]([^"”\n]{2,160})["”]/i)?.[1]?.trim();
   const unquotedCampaign = text.match(/in\s+the\s+campaign\s+([^,\n.]{2,160})/i)?.[1]?.trim();
-  const campaignName = quotedCampaign || unquotedCampaign || "";
+  const bareCampaignBeforeAds = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?)\s+ads\b/i)?.[1]?.trim();
+  const bareCampaignBeforeHave = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?)\s+have\b/i)?.[1]?.trim();
+  const campaignName = quotedCampaign || unquotedCampaign || bareCampaignBeforeAds || bareCampaignBeforeHave || "";
   if (!campaignName) return null;
 
   return {
@@ -720,6 +734,8 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "ad_group.id",
     "ad_group.name",
     "ad_group.status",
+    "metrics.clicks",
+    "metrics.impressions",
     "metrics.cost_micros",
     "metrics.conversions",
     "metrics.cost_per_conversion"
@@ -730,6 +746,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "campaign.status = 'ENABLED'",
     "ad_group.status = 'ENABLED'",
     "metrics.conversions > 0.1",
+    "metrics.clicks > 0",
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -791,7 +808,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   const qualifying = Array.from(byAdGroup.values())
     .map((item) => {
-      if (item.conversions <= 0.1) return null;
+      if (item.conversions <= 0.2) return null;
       const cpaFromMicros = item.costMicros > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
       const cpaFromMetric = item.cpaDirectCount > 0 ? item.cpaDirectSum / item.cpaDirectCount : 0;
       const cpaInr = cpaFromMicros > 0 ? cpaFromMicros : cpaFromMetric;
@@ -812,7 +829,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   ];
 
   if (!count) {
-    lines.push("", "No qualifying ad groups were found with conversions > 0 in this range.");
+    lines.push("", "No qualifying ad groups were found with conversions > 0.2 in this range.");
   } else {
     lines.push("", "| Ad Group | Conversions | Cost / Conversion (INR) |", "| --- | ---: | ---: |");
     sample.forEach((item) => {
