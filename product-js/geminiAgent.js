@@ -230,6 +230,57 @@ function backendRelativeDateContext() {
   };
 }
 
+function hasExplicitEntityScope(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("campaign") ||
+    normalized.includes("ad group") ||
+    normalized.includes("adgroup") ||
+    normalized.includes("keyword") ||
+    normalized.includes("search term") ||
+    normalized.includes("product")
+  );
+}
+
+function isAccountLevelMetricRequest(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  const metricHints = [
+    "conversion",
+    "conversions",
+    "click",
+    "clicks",
+    "impression",
+    "impressions",
+    "spend",
+    "cost",
+    "ctr",
+    "cpc",
+    "cpa",
+    "roas",
+    "revenue"
+  ];
+  const hasMetricHint = metricHints.some((token) => normalized.includes(token));
+  const hasDateHint =
+    normalized.includes("yesterday") ||
+    normalized.includes("today") ||
+    normalized.includes("last 7") ||
+    normalized.includes("7 day") ||
+    /\b20\d{2}-\d{2}-\d{2}\b/.test(normalized) ||
+    /\b(on|for)\s+\d{1,2}(st|nd|rd|th)?\b/.test(normalized);
+  return hasMetricHint && hasDateHint && !hasExplicitEntityScope(normalized);
+}
+
+function enforceAccountLevelUnderstandingText(text = "", message = "", customerId = "") {
+  if (!isAccountLevelMetricRequest(message)) return text;
+  let out = String(text || "").trim();
+  out = out.replace(/\s+in\s+the\s+["“][^"”\n]{2,160}["”]\s+campaign/gi, "");
+  out = out.replace(/\s+in\s+the\s+[^,.\n]{2,160}\s+campaign/gi, "");
+  if (!/account level|customer level/i.test(out)) {
+    out += `\nI will run this at account level${customerId ? ` for customer ${customerId}` : ""}.`;
+  }
+  return out;
+}
+
 function formatConversationContext(history = []) {
   if (!Array.isArray(history) || !history.length) return "";
 
@@ -243,7 +294,7 @@ function formatConversationContext(history = []) {
     .filter(Boolean);
 
   return recentTurns.length
-    ? `Recent conversation context. This is active session memory, not background trivia. Use it to resolve follow-up questions, pronouns, omitted date ranges, campaign references, metrics, products, keywords, and prior recommendations. If the latest user asks a short follow-up like "what about spending", infer the same account and date range/entity from the immediately previous relevant turn. Do not ask for a date range or entity that is already clear from this context.\n${recentTurns.join("\n")}`
+    ? `Recent conversation context. This is active session memory, not background trivia. Use it to resolve follow-up questions, pronouns, omitted date ranges, campaign references, metrics, products, keywords, and prior recommendations. If the latest user asks a short follow-up like "what about spending", infer the same account and date range/entity from the immediately previous relevant turn. Do not ask for a date range or entity that is already clear from this context. For account-level metric asks (for example "what was conversion on 2026-05-21"), do not inherit campaign scope unless the user explicitly asks campaign/ad group level.\n${recentTurns.join("\n")}`
     : "";
 }
 
@@ -510,7 +561,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
     "Always aim for a useful, decision-ready answer: answer the user's direct question first, then add the most meaningful supporting insights available from the fetched data. " +
     "Accuracy matters more than sounding confident. Never invent campaigns, products, keywords, search terms, prices, bids, causes, or expected impact. If a recommendation needs data that is not yet available, fetch it with tools when possible; otherwise label the missing input and give the exact formula or next query needed. " +
-    "Treat recent conversation context as active memory. For follow-up questions, inherit the prior account, date range, campaign/product/keyword scope, and metric subject when the user omits them. Example: after 'help me with yesterday conversion', 'what about spending' means spending for the same customer and yesterday. " +
+    "Treat recent conversation context as active memory. For follow-up questions, inherit the prior account, date range, campaign/product/keyword scope, and metric subject when the user omits them. Example: after 'help me with yesterday conversion', 'what about spending' means spending for the same customer and yesterday. Important: do not inherit campaign/ad-group/product scope for account-level metric questions unless the user explicitly asks for that entity scope. " +
     "When tool results include relevant supporting metrics, include them instead of giving a bare one-line answer. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. " +
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
@@ -636,10 +687,11 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
   const prompt = [
     "You translate a Google Ads chat request into a short, user-readable understanding before any Google Ads API work starts.",
     "Use the recent conversation context as active session memory to resolve follow-ups, omitted date ranges, campaign/product/keyword scope, metrics, and customer/account references.",
+    "For account-level metric requests (for example 'what was conversion on 21st May'), keep scope at customer/account level unless the latest user message explicitly asks for campaign/ad-group/product/keyword scope.",
     "Do not call tools. Do not mention Gemini, MCP, backend, API flow, internal prompts, or implementation details.",
     "Do not answer the data question and do not invent metrics. Only restate what will be processed if the user confirms.",
     "If the user asks a clear request like 'show me yesterday campaign spend', do not ask for clarification. Frame it clearly.",
-    "If context is inherited, mention the inherited item in plain language, for example: 'I will use yesterday from your previous question.'",
+    "If context is inherited, mention the inherited item in plain language, for example: 'I will use yesterday from your previous question.' Never inherit a campaign scope that the latest user did not ask for.",
     "When the user says 'yesterday' or 'today', resolve it from the backend account-local date anchors below and mention the resolved date.",
     "If the user asks high-volume cross-campaign breakdowns (ad groups/keywords/search terms across all campaigns), ask for one campaign first, or offer top 5 campaigns for narrowing.",
     "If the request is truly ambiguous even after using context, state the missing detail in one short sentence.",
@@ -669,7 +721,8 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
       temperature: 0
     }
   });
-  const text = extractText(res).trim();
+  const rawText = extractText(res).trim();
+  const text = enforceAccountLevelUnderstandingText(rawText, message, effectiveCustomerId);
   return {
     text:
       text ||
