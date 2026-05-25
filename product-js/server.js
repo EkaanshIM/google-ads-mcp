@@ -677,8 +677,33 @@ function toFiniteNumber(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function toFiniteNumberLoose(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const cleaned = value.replace(/,/g, "").trim();
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
 function formatNumber(value, maxFractionDigits = 2) {
   return Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: maxFractionDigits });
+}
+
+function parseConversionsVs7dQuery(message) {
+  const normalized = String(message || "").toLowerCase();
+  const mentionsConversions = normalized.includes("conversion");
+  const mentions7d =
+    normalized.includes("7d") ||
+    normalized.includes("7-day") ||
+    normalized.includes("7 day") ||
+    normalized.includes("seven day");
+  const mentionsCompare = normalized.includes("vs") || normalized.includes("compare") || normalized.includes("average");
+  const mentionsYesterday = normalized.includes("yesterday");
+
+  if (!mentionsConversions) return false;
+  return (mentions7d && mentionsCompare) || (mentions7d && mentionsYesterday);
 }
 
 async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) {
@@ -696,14 +721,15 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "ad_group.name",
     "ad_group.status",
     "metrics.cost_micros",
-    "metrics.conversions"
+    "metrics.conversions",
+    "metrics.cost_per_conversion"
   ];
 
   const conditions = [
     `campaign.name = '${escapeGaqlString(campaignName)}'`,
     "campaign.status = 'ENABLED'",
     "ad_group.status = 'ENABLED'",
-    "metrics.conversions > 0",
+    "metrics.conversions > 0.1",
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -738,16 +764,41 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   });
 
   const data = Array.isArray(rows) ? rows : [];
-  const qualifying = data
-    .map((row) => {
-      const adGroupName = String(row?.["ad_group.name"] || "").trim();
-      const conversions = toFiniteNumber(row?.["metrics.conversions"]);
-      const costMicros = toFiniteNumber(row?.["metrics.cost_micros"]);
-      if (!adGroupName || conversions <= 0 || costMicros <= 0) return null;
-      const cpaInr = costMicros / 1_000_000 / conversions;
+  const byAdGroup = new Map();
+  for (const row of data) {
+    const id = String(row?.["ad_group.id"] || "").trim();
+    const name = String(row?.["ad_group.name"] || "").trim();
+    if (!id || !name) continue;
+    const prev = byAdGroup.get(id) || {
+      adGroupId: id,
+      adGroupName: name,
+      conversions: 0,
+      costMicros: 0,
+      cpaDirectSum: 0,
+      cpaDirectCount: 0
+    };
+    const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
+    const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
+    const cpaDirect = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
+    prev.conversions += conversions;
+    prev.costMicros += costMicros;
+    if (cpaDirect > 0) {
+      prev.cpaDirectSum += cpaDirect;
+      prev.cpaDirectCount += 1;
+    }
+    byAdGroup.set(id, prev);
+  }
+
+  const qualifying = Array.from(byAdGroup.values())
+    .map((item) => {
+      if (item.conversions <= 0.1) return null;
+      const cpaFromMicros = item.costMicros > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
+      const cpaFromMetric = item.cpaDirectCount > 0 ? item.cpaDirectSum / item.cpaDirectCount : 0;
+      const cpaInr = cpaFromMicros > 0 ? cpaFromMicros : cpaFromMetric;
+      if (!Number.isFinite(cpaInr) || cpaInr <= 0) return null;
       return {
-        adGroupName,
-        conversions,
+        adGroupName: item.adGroupName,
+        conversions: item.conversions,
         cpaInr
       };
     })
@@ -776,7 +827,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   lines.push(
     "",
-    "Formula used: cost_per_conversion = metrics.cost_micros / 1,000,000 / metrics.conversions."
+    "Formula used: aggregated cost_per_conversion = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
   );
 
   return {
@@ -790,6 +841,118 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
       date_end: dateEnd,
       count,
       rows: qualifying
+    }
+  };
+}
+
+async function runConversionsVs7dFastPath(customerId, context = {}) {
+  const cid = resolvedCustomerId(customerId);
+  const targetDate = accountDateFromOffset(-1);
+  const baselineStart = accountDateFromOffset(-8);
+  const baselineEnd = accountDateFromOffset(-2);
+  const rangeStart = baselineStart;
+  const rangeEnd = targetDate;
+  const mcp = await getMcpClient();
+
+  const toolRequest = {
+    name: "search",
+    arguments: {
+      customer_id: cid,
+      resource: "customer",
+      fields: ["segments.date", "metrics.conversions"],
+      conditions: [`segments.date >= '${rangeStart}'`, `segments.date <= '${rangeEnd}'`],
+      orderings: ["segments.date ASC"],
+      limit: 1000
+    }
+  };
+
+  await logDebugEvent("server.fast_path_mcp_call", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments
+  });
+  const toolOut = await mcp.callTool({
+    name: toolRequest.name,
+    arguments: toolRequest.arguments
+  });
+  const rows = parseMcpToolResult(toolOut);
+  await logDebugEvent("server.fast_path_mcp_result", {
+    ...context,
+    toolName: toolRequest.name,
+    toolArguments: toolRequest.arguments,
+    result: summarizeMcpResult(rows)
+  });
+
+  const data = Array.isArray(rows) ? rows : [];
+  const byDate = new Map();
+  for (const row of data) {
+    const date = String(row?.["segments.date"] || "").trim();
+    if (!date) continue;
+    byDate.set(date, toFiniteNumberLoose(row?.["metrics.conversions"]));
+  }
+
+  const targetValue = byDate.get(targetDate);
+  const baselineDates = [];
+  for (let offset = -8; offset <= -2; offset += 1) baselineDates.push(accountDateFromOffset(offset));
+  const baselineValues = baselineDates
+    .map((date) => byDate.get(date))
+    .filter((value) => Number.isFinite(value));
+
+  if (!Number.isFinite(targetValue)) {
+    return {
+      text: `I could not find conversion data for yesterday (${targetDate}) in this account timezone. Please verify data freshness and try a specific date range.`,
+      customerIdUsed: cid,
+      mode: "fast-path",
+      result: {
+        target_date: targetDate,
+        baseline_start: baselineStart,
+        baseline_end: baselineEnd,
+        rows_available: data.length
+      }
+    };
+  }
+
+  if (!baselineValues.length) {
+    return {
+      text: `I found yesterday's conversions (${targetDate}: ${formatNumber(targetValue)}), but baseline data for ${baselineStart} to ${baselineEnd} is unavailable.`,
+      customerIdUsed: cid,
+      mode: "fast-path",
+      result: {
+        target_date: targetDate,
+        baseline_start: baselineStart,
+        baseline_end: baselineEnd,
+        target_conversions: targetValue
+      }
+    };
+  }
+
+  const baselineAvg = baselineValues.reduce((sum, value) => sum + value, 0) / baselineValues.length;
+  const absoluteChange = targetValue - baselineAvg;
+  const percentChange = baselineAvg !== 0 ? (absoluteChange / baselineAvg) * 100 : null;
+
+  const lines = [
+    `For customer ${cid}, conversion comparison uses explicit account-local dates (no hardcoded date):`,
+    `Target day (yesterday): ${targetDate}`,
+    `Baseline (previous 7 complete days): ${baselineStart} to ${baselineEnd}`,
+    "",
+    `Conversions on ${targetDate}: ${formatNumber(targetValue)}`,
+    `Average daily conversions (${baselineStart} to ${baselineEnd}): ${formatNumber(baselineAvg)}`,
+    `Absolute change: ${absoluteChange >= 0 ? "+" : ""}${formatNumber(absoluteChange)}`,
+    `Percent change: ${percentChange == null ? "N/A" : `${percentChange >= 0 ? "+" : ""}${percentChange.toFixed(2)}%`}`
+  ];
+
+  return {
+    text: lines.join("\n"),
+    customerIdUsed: cid,
+    mode: "fast-path",
+    result: {
+      target_date: targetDate,
+      baseline_start: baselineStart,
+      baseline_end: baselineEnd,
+      target_conversions: targetValue,
+      baseline_average: baselineAvg,
+      absolute_change: absoluteChange,
+      percent_change: percentChange
     }
   };
 }
@@ -886,6 +1049,12 @@ async function runChatJob(job) {
     sessionId: job.sessionId,
     userMessage: job.message
   };
+
+  if (parseConversionsVs7dQuery(job.message)) {
+    await updateJob(job.id, { phase: "ads" });
+    const out = await runConversionsVs7dFastPath(job.customerId, context);
+    return { ...out, interpretedQuery: job.interpretedQuery || "" };
+  }
 
   const adGroupCpaQuestion = parseAdGroupCpaThresholdQuestion(job.message);
   if (adGroupCpaQuestion) {
