@@ -499,6 +499,17 @@ function hasSpecificCampaignScope(message) {
   return hasQuotedCampaign || hasCampaignId || hasNamedCampaign || hasBareNamedCampaign;
 }
 
+function hasBroadCampaignScope(message) {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("all campaign") ||
+    normalized.includes("across campaign") ||
+    normalized.includes("across all campaign") ||
+    normalized.includes("entire campaign") ||
+    normalized.includes("every campaign")
+  );
+}
+
 function parseAdGroupCpaThresholdQuestion(message) {
   const text = String(message || "");
   const normalized = text.toLowerCase();
@@ -803,7 +814,6 @@ function buildNarrowScopePrompt(job) {
     lines.push("", "I can use one of these recently discussed campaigns:");
     options.forEach((name, index) => lines.push(`${index + 1}. ${name}`));
   }
-  lines.push("", "If you want me to start broad, ask: 'show top 5 performing campaigns first'.");
   return lines.join("\n");
 }
 
@@ -1209,7 +1219,7 @@ async function runChatJob(job) {
   }
 
   if (isHighVolumeBreakdownQuestion(job.message) && !hasSpecificCampaignScope(job.message)) {
-    if (isAllCampaignScopeRequest(job.message)) {
+    if (isAllCampaignScopeRequest(job.message) || hasBroadCampaignScope(job.message)) {
       await updateJob(job.id, { phase: "ads" });
       const out = await runTopCampaignPreviewFastPath(job.customerId, context);
       return { ...out, interpretedQuery: job.interpretedQuery || "" };

@@ -356,6 +356,33 @@ function formatConversationContext(history = []) {
     : "";
 }
 
+function isCountStyleRequest(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  const asksCount =
+    normalized.includes("how many") ||
+    normalized.includes("count") ||
+    normalized.includes("number of") ||
+    normalized.includes("total number") ||
+    normalized.startsWith("find the number") ||
+    normalized.startsWith("what is the number");
+  const asksListing = normalized.includes("show") || normalized.includes("list") || normalized.includes("which");
+  return asksCount && !normalized.includes("analy") && !normalized.includes("why") && !normalized.includes("reason") && !asksListing;
+}
+
+function isAnalysisStyleRequest(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("analy") ||
+    normalized.includes("what happened") ||
+    normalized.includes("yesterday happened") ||
+    normalized.includes("why") ||
+    normalized.includes("reason") ||
+    normalized.includes("stable") ||
+    normalized.includes("good or bad") ||
+    normalized.includes("performance")
+  );
+}
+
 function requestPolicy(message) {
   const normalized = String(message || "").toLowerCase();
   const rules = [
@@ -365,6 +392,22 @@ function requestPolicy(message) {
     "For campaign ranking, product status, 7-day comparison, or account summary questions, prefer deterministic analytics tools over raw search.",
     "Always present Google Ads money values as INR; never use $ or USD for this account."
   ];
+
+  if (isCountStyleRequest(normalized)) {
+    rules.push(
+      "This is a count/lookup request. Return the exact count and the minimum supporting facts only.",
+      "Do not add diagnosis, causes, operational warnings, strategic recommendations, or unrelated account history unless the user explicitly asks for analysis.",
+      "Do not mention tool internals or invented context."
+    );
+  }
+
+  if (isAnalysisStyleRequest(normalized)) {
+    rules.push(
+      "This is an analysis request. Explain whether performance was stable, improving, or worsening, and support that with fetched metrics and date ranges.",
+      "When the user asks what happened yesterday or similar, fetch the exact period and compare it to a relevant baseline when available.",
+      "Include the concrete drivers, then give a concise takeaway and next action if the data supports it."
+    );
+  }
 
   if (
     normalized.includes("campaign") &&
@@ -617,12 +660,12 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "You are running inside the production backend where all MCP tools passed in config are approved for use without interactive confirmation. " +
     "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
     "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
-    "Always aim for a useful, decision-ready answer: answer the user's direct question first, then add the most meaningful supporting insights available from the fetched data. " +
-    "Accuracy matters more than sounding confident. Never invent campaigns, products, keywords, search terms, prices, bids, causes, or expected impact. If a recommendation needs data that is not yet available, fetch it with tools when possible; otherwise label the missing input and give the exact formula or next query needed. " +
+    "Always answer the user's direct question first. Then decide how much detail to add based on the request: keep count/lookup answers short and exact, and give fuller diagnostic detail only for analysis or optimization questions. " +
+    "Accuracy matters more than sounding confident. Never invent campaigns, products, keywords, search terms, prices, bids, causes, expected impact, people, companies, account events, or verification issues. If a claim is not supported by tool results or explicit conversation context, omit it. If a recommendation needs data that is not yet available, fetch it with tools when possible; otherwise label the missing input and give the exact formula or next query needed. " +
     "Treat recent conversation context as active memory. For follow-up questions, inherit the prior account, date range, campaign/product/keyword scope, and metric subject when the user omits them. Example: after 'help me with yesterday conversion', 'what about spending' means spending for the same customer and yesterday. Important: do not inherit campaign/ad-group/product scope for account-level metric questions unless the user explicitly asks for that entity scope. " +
-    "When tool results include relevant supporting metrics, include them instead of giving a bare one-line answer. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. " +
+    "When tool results include relevant supporting metrics, include them for analysis questions. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. For count questions, do not expand into broad commentary unless asked. " +
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
-    "When there are meaningful patterns, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
+    "When there are meaningful patterns in analysis questions, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
     "For optimization and diagnostic answers, be specific before being strategic. Name the actual campaigns, ad groups, products, search terms, keywords, assets, or segments that are driving the metric change when tools can fetch them. " +
     "Do not stop at generic advice. For every major recommendation, include: evidence from the data, the exact change to make, how to make it in Google Ads or the feed, expected directional impact, risk/guardrail, and what to check next. " +
     "When the data needed for a detailed diagnosis is not yet fetched, run additional focused drill-down queries before answering instead of saying to 'review' something. Useful drill-downs include product trend drops, dead-click products with spend/clicks and zero conversions, search terms with spend and no conversions, keywords with rising CPC or falling CTR, and products/terms that gained conversions efficiently. " +
@@ -639,7 +682,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "For campaign status questions, interpret running, active, live, currently running, or enabled campaigns as campaign.status = 'ENABLED'. Do not include PAUSED or REMOVED campaigns in a running/active/live count unless the user explicitly asks for paused, inactive, all statuses, or a status breakdown. " +
     "For simple campaign counts, use count_rows on the campaign resource with field campaign.id and the appropriate status condition instead of fetching every campaign row. " +
     "For broad listing questions, request only the fields needed, always use a LIMIT, and summarize instead of returning huge raw result sets. If the user asks for all rows and the result may be large, ask them to narrow the request or provide a small sample with the total count. " +
-    "When a user requests ad group, keyword, or search-term breakdowns across many campaigns and the dataset may be large, ask for one specific campaign before running deep breakdown queries. If the user still wants all campaigns, return top 5 performing campaigns first, then ask which campaign to drill into. " +
+    "When a user requests ad group, keyword, or search-term breakdowns across many campaigns and the dataset may be large, ask for one specific campaign before running deep breakdown queries. If the user still wants all campaigns, offer a broad campaign preview only when it helps narrowing; do not force a top-5 preview when the user already named a specific campaign. " +
     "When a request requires calculations, comparisons, deltas, averages, rankings, totals, or trend analysis, fetch the needed finite data ranges with the tools and do the arithmetic yourself. " +
     "Use the narrowest correct aggregation grain: for whole-account totals use the customer resource with metric fields; for campaign, ad group, keyword, search-term, asset, or conversion-action breakdowns use the matching resource and fields. " +
     "For spend/cost, query metrics.cost_micros and convert micros to currency units by dividing by 1,000,000. Present money as INR even if customer.currency_code is missing or unexpected. " +
@@ -648,9 +691,9 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "For click-performance questions, include enough supporting metrics to make the answer meaningful: usually metrics.clicks, metrics.ctr, metrics.average_cpc, and metrics.cost_micros. Convert average_cpc and cost_micros from micros to currency units and present them as INR. " +
     "For highest-performing or best/worst entity questions, state the winner, exact date range, primary ranking metric and value, then provide a short metric breakdown with relevant supporting metrics. Do not answer with only the entity name and one number when supporting metrics were available. " +
     "For campaign best/worst/top/bottom performance questions, never rank from an unordered limited sample. Use campaign.status = 'ENABLED' by default, fetch a complete candidate set with a large enough limit, and include clicks, impressions, CTR, average CPC, cost, and conversions. If a fetched sample shows all zero metrics, verify with a customer-level totals query for the same date before saying all campaigns had zero activity. " +
-    "For campaign recommendation questions, produce decision-ready diagnostic reporting: summarize what went right, what went wrong, likely metric-based reasons, and suggested modifications. Keep recommendations grounded in tool data and say they should be validated against business goals, margins, inventory, and conversion quality. " +
+    "For campaign recommendation and analysis questions, produce decision-ready diagnostic reporting: summarize what went right, what went wrong, likely metric-based reasons, and suggested modifications. Keep recommendations grounded in tool data and say they should be validated against business goals, margins, inventory, and conversion quality. " +
     "For boost/business-growth questions, call campaign_growth_decision_brief and return concrete actions: exact search terms to scale or negative, bid/CPC range or budget lift percentage, expected incremental conversion formula/range, risk guardrail, and monitoring rule. Do not answer that a stable campaign has nothing to do; stable performance should lead to a controlled scale test when CPA and conversion volume support it. " +
-    "Recommended structure for campaign diagnostics: Executive read, What improved, What declined, Specific drivers, Dead-click/wasted-spend opportunities, Working keywords/search terms/products to scale, Action plan with how/why/expected impact, and Monitoring checklist. Omit sections only when they truly do not apply. " +
+    "Recommended structure for campaign diagnostics: Executive read, What improved, What declined, Specific drivers, Dead-click/wasted-spend opportunities, Working keywords/search terms/products to scale, Action plan with how/why/expected impact, and Monitoring checklist. Omit sections only when they truly do not apply. Use this structure for analysis questions, not count-only questions. " +
     "For relative dates such as yesterday, today, this week, last week, last 7 days, or last month, resolve the date range before querying and use explicit finite YYYY-MM-DD GAQL conditions on segments.date. " +
     `Resolve account-local relative dates using backend timezone ${relativeDates.timeZone}: today=${relativeDates.today}, yesterday=${relativeDates.yesterday}. ` +
     `For default 7-day-average comparisons, use target day ${relativeDates.yesterday} and baseline ${relativeDates.sevenDayBaselineStart} to ${relativeDates.sevenDayBaselineEnd} unless the user specifies otherwise. ` +
@@ -746,12 +789,13 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
     "You translate a Google Ads chat request into a short, user-readable understanding before any Google Ads API work starts.",
     "Use the recent conversation context as active session memory to resolve follow-ups, omitted date ranges, campaign/product/keyword scope, metrics, and customer/account references.",
     "For account-level metric requests (for example 'what was conversion on 21st May'), keep scope at customer/account level unless the latest user message explicitly asks for campaign/ad-group/product/keyword scope.",
+    "If the message is a count or lookup request, keep the understanding short and exact. If the message asks for analysis, explain that you will analyze the data and compare it to a relevant baseline when needed.",
     "Do not call tools. Do not mention Gemini, MCP, backend, API flow, internal prompts, or implementation details.",
     "Do not answer the data question and do not invent metrics. Only restate what will be processed if the user confirms.",
     "If the user asks a clear request like 'show me yesterday campaign spend', do not ask for clarification. Frame it clearly.",
     "If context is inherited, mention the inherited item in plain language, for example: 'I will use yesterday from your previous question.' Never inherit a campaign scope that the latest user did not ask for.",
     "When the user says 'yesterday' or 'today', resolve it from the backend account-local date anchors below and mention the resolved date.",
-    "If the user asks high-volume cross-campaign breakdowns (ad groups/keywords/search terms across all campaigns), ask for one campaign first, or offer top 5 campaigns for narrowing.",
+    "If the user asks high-volume cross-campaign breakdowns (ad groups/keywords/search terms across all campaigns), ask for one campaign first. Do not suggest top 5 campaigns when the user already named a specific campaign.",
     "If the request is truly ambiguous even after using context, state the missing detail in one short sentence.",
     "Return only the confirmation text, in 2-4 short lines.",
     "",
