@@ -651,9 +651,9 @@ function scoreCampaignNameMatch(requestedCampaignName, candidateName) {
   };
 }
 
-async function resolveCampaignForAccount(customerId, requestedCampaignName, context = {}) {
+async function resolveCampaignCandidatesForAccount(customerId, requestedCampaignName, context = {}) {
   const requested = String(requestedCampaignName || "").trim();
-  if (!requested) return null;
+  if (!requested) return [];
 
   const cid = resolvedCustomerId(customerId);
   const mcp = await getMcpClient();
@@ -690,11 +690,25 @@ async function resolveCampaignForAccount(customerId, requestedCampaignName, cont
     .sort((a, b) => {
       if (a.exact !== b.exact) return a.exact ? -1 : 1;
       if (a.contains !== b.contains) return a.contains ? -1 : 1;
+      if (a.status !== b.status) {
+        if (a.status === "ENABLED") return -1;
+        if (b.status === "ENABLED") return 1;
+      }
       if (a.tokensMatched !== b.tokensMatched) return b.tokensMatched - a.tokensMatched;
       return a.nameLength - b.nameLength;
     });
 
-  const best = scored[0] || null;
+  const candidates = scored.slice(0, 8).map((item) => ({
+    id: item.id,
+    name: item.name,
+    status: item.status,
+    match: {
+      exact: item.exact,
+      contains: item.contains,
+      tokensMatched: item.tokensMatched
+    }
+  }));
+  const best = candidates[0] || null;
   await logDebugEvent("server.campaign_resolution_result", {
     ...context,
     requestedCampaignName: requested,
@@ -702,22 +716,16 @@ async function resolveCampaignForAccount(customerId, requestedCampaignName, cont
     selectedCampaignId: best?.id || null,
     selectedCampaignName: best?.name || null,
     selectedCampaignStatus: best?.status || null,
-    selectedMatch: best
-      ? {
-          exact: best.exact,
-          contains: best.contains,
-          tokensMatched: best.tokensMatched
-        }
-      : null
+    selectedMatch: best?.match || null,
+    candidates
   });
 
-  return best
-    ? {
-        id: best.id,
-        name: best.name,
-        status: best.status
-      }
-    : null;
+  return candidates;
+}
+
+async function resolveCampaignForAccount(customerId, requestedCampaignName, context = {}) {
+  const candidates = await resolveCampaignCandidatesForAccount(customerId, requestedCampaignName, context);
+  return candidates[0] || null;
 }
 
 async function resolveCampaignNameForAccount(customerId, requestedCampaignName, context = {}) {
@@ -934,8 +942,10 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   const cid = resolvedCustomerId(customerId);
   const thresholdInr = Number(params?.thresholdInr || 500);
   const requestedCampaignName = String(params?.campaignName || "").trim();
-  const resolvedCampaign = await resolveCampaignForAccount(cid, requestedCampaignName, context);
-  const campaignName = resolvedCampaign?.name || requestedCampaignName;
+  const resolvedCampaignCandidates = await resolveCampaignCandidatesForAccount(cid, requestedCampaignName, context);
+  const campaignScopes = resolvedCampaignCandidates.length
+    ? resolvedCampaignCandidates.slice(0, 5)
+    : [{ id: "", name: requestedCampaignName, status: "", match: null }];
   const dateEnd = String(params?.dateEnd || "").trim() || accountDateFromOffset(-1);
   const dateStart = String(params?.dateStart || "").trim() || accountDateFromOffset(-7);
   const usedExplicitRange = Boolean(params?.dateStart && params?.dateEnd);
@@ -948,79 +958,88 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "ad_group.id",
     "ad_group.name",
     "ad_group.status",
-    "segments.date",
     "metrics.cost_micros",
     "metrics.conversions"
   ];
 
-  const conditions = [
-    resolvedCampaign?.id
-      ? `campaign.id = ${resolvedCampaign.id}`
-      : `campaign.name = '${escapeGaqlString(campaignName)}'`,
-    `segments.date >= '${dateStart}'`,
-    `segments.date <= '${dateEnd}'`
-  ];
+  const attempts = [];
+  for (const campaignScope of campaignScopes) {
+    const scopeName = campaignScope?.name || requestedCampaignName;
+    const conditions = [
+      campaignScope?.id
+        ? `campaign.id = ${campaignScope.id}`
+        : `campaign.name = '${escapeGaqlString(scopeName)}'`,
+      "campaign.status = 'ENABLED'",
+      "ad_group.status = 'ENABLED'",
+      "metrics.conversions > 0",
+      `segments.date >= '${dateStart}'`,
+      `segments.date <= '${dateEnd}'`
+    ];
 
-  const toolRequest = {
-    name: "search",
-    arguments: {
-      customer_id: cid,
-      resource: "ad_group",
-      fields,
-      conditions,
-      orderings: ["metrics.cost_micros DESC"],
-      limit: 10000
-    }
-  };
-
-  await logDebugEvent("server.fast_path_mcp_call", {
-    ...context,
-    toolName: toolRequest.name,
-    toolArguments: toolRequest.arguments
-  });
-  const toolOut = await mcp.callTool({
-    name: toolRequest.name,
-    arguments: toolRequest.arguments
-  });
-  const rows = parseMcpToolResult(toolOut);
-  await logDebugEvent("server.fast_path_mcp_result", {
-    ...context,
-    toolName: toolRequest.name,
-    toolArguments: toolRequest.arguments,
-    result: summarizeMcpResult(rows)
-  });
-
-  const data = Array.isArray(rows) ? rows : [];
-  const byAdGroup = new Map();
-  for (const row of data) {
-    const id = String(row?.["ad_group.id"] || "").trim();
-    const name = String(row?.["ad_group.name"] || "").trim();
-    if (!id || !name) continue;
-    const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
-    const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
-    const prev = byAdGroup.get(id) || {
-      adGroupId: id,
-      adGroupName: name,
-      conversions: 0,
-      costMicros: 0
+    const toolRequest = {
+      name: "search",
+      arguments: {
+        customer_id: cid,
+        resource: "ad_group",
+        fields,
+        conditions,
+        orderings: ["metrics.cost_micros DESC"],
+        limit: 10000
+      }
     };
-    prev.conversions += conversions;
-    prev.costMicros += costMicros;
-    byAdGroup.set(id, prev);
+
+    await logDebugEvent("server.fast_path_mcp_call", {
+      ...context,
+      toolName: toolRequest.name,
+      toolArguments: toolRequest.arguments,
+      campaignScope
+    });
+    const toolOut = await mcp.callTool({
+      name: toolRequest.name,
+      arguments: toolRequest.arguments
+    });
+    const rows = parseMcpToolResult(toolOut);
+    await logDebugEvent("server.fast_path_mcp_result", {
+      ...context,
+      toolName: toolRequest.name,
+      toolArguments: toolRequest.arguments,
+      campaignScope,
+      result: summarizeMcpResult(rows)
+    });
+
+    const data = Array.isArray(rows) ? rows : [];
+    const qualifying = data
+      .map((row) => {
+        const adGroupName = String(row?.["ad_group.name"] || "").trim();
+        const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
+        const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
+        if (!adGroupName || conversions <= 0 || costMicros <= 0) return null;
+        const cpaInr = costMicros / 1_000_000 / conversions;
+        if (!Number.isFinite(cpaInr) || cpaInr <= thresholdInr) return null;
+        return {
+          adGroupName,
+          conversions,
+          cpaInr
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.cpaInr - a.cpaInr);
+
+    attempts.push({
+      campaign: campaignScope,
+      rowsFetched: data.length,
+      qualifying
+    });
   }
 
-  const qualifying = Array.from(byAdGroup.values())
-    .map((item) => {
-      const cpaInr = item.conversions > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
-      if (!Number.isFinite(cpaInr) || cpaInr <= thresholdInr) return null;
-      return {
-        adGroupName: item.adGroupName,
-        conversions: item.conversions,
-        cpaInr
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.cpaInr - a.cpaInr);
+  const chosenAttempt =
+    attempts.find((attempt) => attempt.qualifying.length > 0) ||
+    attempts.find((attempt) => attempt.rowsFetched > 0) ||
+    attempts[0] ||
+    { campaign: { id: "", name: requestedCampaignName, status: "" }, rowsFetched: 0, qualifying: [] };
+  const resolvedCampaign = chosenAttempt.campaign;
+  const campaignName = resolvedCampaign?.name || requestedCampaignName;
+  const qualifying = chosenAttempt.qualifying;
 
   const count = qualifying.length;
   const sample = qualifying.slice(0, 25);
@@ -1060,8 +1079,15 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
       threshold_inr: thresholdInr,
       date_start: dateStart,
       date_end: dateEnd,
-      rows_fetched: data.length,
-      ad_groups_scanned: byAdGroup.size,
+      rows_fetched: chosenAttempt.rowsFetched,
+      ad_groups_scanned: chosenAttempt.rowsFetched,
+      campaign_attempts: attempts.map((attempt) => ({
+        campaign_id: attempt.campaign?.id || null,
+        campaign_name: attempt.campaign?.name || null,
+        campaign_status: attempt.campaign?.status || null,
+        rows_fetched: attempt.rowsFetched,
+        qualifying_count: attempt.qualifying.length
+      })),
       count,
       rows: qualifying
     }
