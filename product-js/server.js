@@ -1061,6 +1061,12 @@ function summarizeChangeEventSignals(rows = []) {
   return { counts, events };
 }
 
+function toSharePercent(value) {
+  const numeric = toFiniteNumberLoose(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric <= 1 ? numeric * 100 : numeric;
+}
+
 async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) {
   const cid = resolvedCustomerId(customerId);
   const thresholdInr = Number(params?.thresholdInr || 500);
@@ -1357,6 +1363,130 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
     return parsed;
   };
 
+  const fetchCampaignImpressionShareSnapshot = async () => {
+    const fieldSets = [
+      [
+        "campaign.id",
+        "campaign.name",
+        "campaign.status",
+        "metrics.search_impression_share",
+        "metrics.search_budget_lost_impression_share",
+        "metrics.search_rank_lost_impression_share",
+        "metrics.search_top_impression_share",
+        "metrics.search_absolute_top_impression_share",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.cost_micros",
+        "metrics.conversions"
+      ],
+      [
+        "campaign.id",
+        "campaign.name",
+        "campaign.status",
+        "metrics.search_impression_share",
+        "metrics.search_budget_lost_impression_share",
+        "metrics.search_rank_lost_impression_share",
+        "metrics.top_impression_percentage",
+        "metrics.absolute_top_impression_percentage",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.cost_micros",
+        "metrics.conversions"
+      ]
+    ];
+    let lastError = null;
+
+    for (const fields of fieldSets) {
+      try {
+        const rows = await callParsedTool("search", {
+          customer_id: cid,
+          resource: "campaign",
+          fields,
+          conditions: [`segments.date = '${targetDate}'`, "campaign.status = 'ENABLED'"],
+          orderings: ["metrics.impressions DESC"],
+          limit: 1000
+        });
+        const items = (Array.isArray(rows) ? rows : [])
+          .map((row) => {
+            const budgetLostShare = toSharePercent(
+              row?.["metrics.search_budget_lost_impression_share"] ??
+                row?.["metrics.search_budget_lost_impr. share"] ??
+                row?.["metrics.search_budget_lost_impr_share"]
+            );
+            const rankLostShare = toSharePercent(row?.["metrics.search_rank_lost_impression_share"]);
+            const searchShare = toSharePercent(
+              row?.["metrics.search_impression_share"] ??
+                row?.["metrics.search_top_impression_share"] ??
+                row?.["metrics.top_impression_percentage"]
+            );
+            const absoluteTopShare = toSharePercent(
+              row?.["metrics.search_absolute_top_impression_share"] ??
+                row?.["metrics.absolute_top_impression_percentage"]
+            );
+            const clicks = toFiniteNumberLoose(row?.["metrics.clicks"]);
+            const impressions = toFiniteNumberLoose(row?.["metrics.impressions"]);
+            const cost = toFiniteNumberLoose(row?.["metrics.cost_micros"]) / 1_000_000;
+            const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
+            const priorityScore = (budgetLostShare || 0) + (rankLostShare || 0);
+            return {
+              campaignId: String(row?.["campaign.id"] || "").trim(),
+              campaignName: String(row?.["campaign.name"] || "").trim(),
+              campaignStatus: String(row?.["campaign.status"] || "").trim(),
+              searchShare,
+              budgetLostShare,
+              rankLostShare,
+              absoluteTopShare,
+              clicks,
+              impressions,
+              cost,
+              conversions,
+              priorityScore
+            };
+          })
+          .filter((item) => item.campaignId);
+
+        if (!items.length) continue;
+        const summary = items.reduce(
+          (accumulator, item) => {
+            accumulator.rowCount += 1;
+            if (Number.isFinite(item.searchShare)) accumulator.maxSearchShare = Math.max(accumulator.maxSearchShare, item.searchShare);
+            if (Number.isFinite(item.budgetLostShare))
+              accumulator.maxBudgetLostShare = Math.max(accumulator.maxBudgetLostShare, item.budgetLostShare);
+            if (Number.isFinite(item.rankLostShare))
+              accumulator.maxRankLostShare = Math.max(accumulator.maxRankLostShare, item.rankLostShare);
+            if (Number.isFinite(item.absoluteTopShare))
+              accumulator.maxAbsoluteTopShare = Math.max(accumulator.maxAbsoluteTopShare, item.absoluteTopShare);
+            return accumulator;
+          },
+          {
+            rowCount: 0,
+            maxSearchShare: null,
+            maxBudgetLostShare: null,
+            maxRankLostShare: null,
+            maxAbsoluteTopShare: null
+          }
+        );
+
+        return {
+          available: true,
+          fields,
+          summary,
+          items: items.sort((a, b) => b.priorityScore - a.priorityScore).slice(0, 5)
+        };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    return {
+      available: false,
+      error: lastError?.message || null,
+      fields: [],
+      summary: null,
+      items: []
+    };
+  };
+
   const [targetSummaryRaw, baselineSummaryRaw, conversionsCompareRaw, clicksCompareRaw, impressionsCompareRaw, costCompareRaw, diagnosisRaw, changeEventsRaw] =
     await Promise.all([
       callParsedTool("account_metric_summary", {
@@ -1419,7 +1549,7 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
         ],
         conditions: [
           "change_event.change_date_time DURING LAST_30_DAYS",
-          "change_event.change_resource_type = 'CAMPAIGN'"
+          "change_event.resource_change_operation = 'UPDATE'"
         ],
         orderings: ["change_event.change_date_time DESC"],
         limit: 2000
@@ -1475,6 +1605,8 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
       ? ((targetConversionRate - baselineConversionRate) / baselineConversionRate) * 100
       : null;
 
+  const impressionShareSnapshot = await fetchCampaignImpressionShareSnapshot();
+
   const compareRawByMetric = {
     conversions: conversionsCompareRaw,
     clicks: clicksCompareRaw,
@@ -1482,6 +1614,7 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
     cost: costCompareRaw
   };
   const campaignMap = new Map();
+  const positiveCampaignMap = new Map();
   for (const [metricName, compareRaw] of Object.entries(compareRawByMetric)) {
     const rows = Array.isArray(compareRaw?.largest_decreases) ? compareRaw.largest_decreases : [];
     for (const row of rows) {
@@ -1511,100 +1644,174 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
       }
       campaignMap.set(campaignId, entry);
     }
+
+    const gainRows = Array.isArray(compareRaw?.largest_increases) ? compareRaw.largest_increases : [];
+    for (const row of gainRows) {
+      const campaignId = String(row?.campaign_id || "").trim();
+      if (!campaignId) continue;
+      const campaignName = String(row?.campaign_name || "").trim();
+      const absoluteChange = toFiniteNumberLoose(row?.absolute_change);
+      if (absoluteChange <= 0) continue;
+      const percentChange = Number.isFinite(Number(row?.percent_change)) ? Number(row.percent_change) : null;
+      const entry = positiveCampaignMap.get(campaignId) || {
+        campaignId,
+        campaignName,
+        campaignStatus: String(row?.campaign_status || "").trim(),
+        metrics: {},
+        score: 0
+      };
+      if (campaignName && !entry.campaignName) entry.campaignName = campaignName;
+      if (row?.campaign_status && !entry.campaignStatus) entry.campaignStatus = String(row.campaign_status).trim();
+      entry.metrics[metricName] = {
+        targetValue: toFiniteNumberLoose(row?.target_value),
+        baselineAverage: toFiniteNumberLoose(row?.baseline_average),
+        absoluteChange,
+        percentChange
+      };
+      entry.score += Math.abs(percentChange ?? absoluteChange);
+      positiveCampaignMap.set(campaignId, entry);
+    }
   }
 
   const topCampaignDrivers = Array.from(campaignMap.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
+  const topPositiveCampaigns = Array.from(positiveCampaignMap.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
 
   const changeEvents = Array.isArray(changeEventsRaw) ? changeEventsRaw : [];
   const changeSummary = summarizeChangeEventSignals(changeEvents);
   const relevantChangeEvents = changeSummary.events.filter((event) =>
-    /status|budget|bid|bidding|target roas|target cpa/i.test(event.labelText)
+    /status|budget|bid|bidding|target roas|target cpa|policy|verification/i.test(event.labelText)
   );
 
   const diagnosis = diagnosisRaw || {};
-  const diagnosisWrong = Array.isArray(diagnosis.what_went_wrong) ? diagnosis.what_went_wrong : [];
-  const diagnosisRecommendations = Array.isArray(diagnosis.recommended_modification_types)
-    ? diagnosis.recommended_modification_types
-    : [];
   const accountName = targetSummaryRaw?.account_name || baselineSummaryRaw?.account_name || "IndiaMART";
+  const budgetLostShare = impressionShareSnapshot?.summary?.maxBudgetLostShare;
+  const rankLostShare = impressionShareSnapshot?.summary?.maxRankLostShare;
+  const hasTrafficCliff =
+    accountPercentChange.clicks != null &&
+    accountPercentChange.clicks <= -20 &&
+    accountPercentChange.impressions != null &&
+    accountPercentChange.impressions <= -20;
+  const hasStableConversionRate = conversionRateChange == null || Math.abs(conversionRateChange) <= 15;
+  const costDown = accountPercentChange.cost != null && accountPercentChange.cost <= -20;
+  const bidOrBudgetSignals =
+    changeSummary.counts.budget +
+    changeSummary.counts.bidding +
+    changeSummary.counts.target_roas +
+    changeSummary.counts.target_cpa;
+  const statusSignals = changeSummary.counts.status;
+  const policySignals = changeSummary.counts.policy + changeSummary.counts.verification;
+  let rootCauseLabel = "mixed_pressure";
+  let rootCauseLine = "The data suggests mixed traffic and efficiency pressure.";
+  if (hasTrafficCliff && hasStableConversionRate) {
+    if (Number.isFinite(budgetLostShare) && budgetLostShare >= 20 && (!Number.isFinite(rankLostShare) || budgetLostShare >= rankLostShare)) {
+      rootCauseLabel = "budget_constraint";
+      rootCauseLine = "The main driver looks like budget pressure: impressions and clicks collapsed, and the impression-share snapshot suggests budget-lost share is high.";
+    } else if (Number.isFinite(rankLostShare) && rankLostShare >= 20 && (!Number.isFinite(budgetLostShare) || rankLostShare > budgetLostShare)) {
+      rootCauseLabel = "auction_competitiveness";
+      rootCauseLine = "The main driver looks like auction competitiveness or ad-rank pressure: traffic collapsed and the impression-share snapshot suggests rank-lost share is high.";
+    } else if (bidOrBudgetSignals > 0) {
+      rootCauseLabel = "recent_bid_or_budget_change";
+      rootCauseLine = "The main driver appears to be a recent bid, budget, target ROAS, or target CPA change that coincides with the traffic collapse.";
+    } else if (statusSignals > 0) {
+      rootCauseLabel = "status_or_serving_shift";
+      rootCauseLine = "The main driver appears to be a status or serving shift captured in change history.";
+    } else {
+      rootCauseLabel = "broad_traffic_contraction";
+      rootCauseLine = "The main driver is broad traffic contraction: clicks and impressions fell sharply across multiple campaigns while conversion rate stayed relatively close to baseline.";
+    }
+  } else if (accountPercentChange.conversions != null && accountPercentChange.conversions <= -20 && conversionRateChange != null && conversionRateChange <= -20) {
+    rootCauseLabel = "conversion_rate_regression";
+    rootCauseLine = "The main driver is a conversion-efficiency regression: traffic fell, but the bigger problem is that clicks are converting worse than before.";
+  } else if (costDown && (hasTrafficCliff || accountPercentChange.conversions != null && accountPercentChange.conversions <= -20)) {
+    rootCauseLabel = "serving_or_budget_suppression";
+    rootCauseLine = "The main driver is serving or budget suppression: spend, clicks, and impressions all fell together.";
+  } else if (policySignals > 0) {
+    rootCauseLabel = "policy_or_verification_change_history";
+    rootCauseLine = "Change history contains policy or verification-related edits, but this does not by itself prove a live policy or verification block.";
+  }
 
   const lines = [
-    `For account ${accountName} (${cid}), yesterday (${targetDate}) looks like a traffic cliff, not a single-metric blip.`,
+    `Executive read: ${accountName} (${cid}) had a traffic cliff on ${targetDate}, not a slow trend.`,
+    `Primary cause: ${rootCauseLine}`,
     "",
-    "Account-level comparison vs the previous 7 complete days:",
+    "Evidence:",
     `- Clicks: ${formatNumber(accountTotals.target.clicks)} vs ${formatNumber(accountTotals.baselineDaily.clicks)} avg/day (${formatSignedPercent(accountPercentChange.clicks)})`,
     `- Impressions: ${formatNumber(accountTotals.target.impressions)} vs ${formatNumber(accountTotals.baselineDaily.impressions)} avg/day (${formatSignedPercent(accountPercentChange.impressions)})`,
     `- Cost: INR ${formatNumber(accountTotals.target.cost)} vs INR ${formatNumber(accountTotals.baselineDaily.cost)} avg/day (${formatSignedPercent(accountPercentChange.cost)})`,
     `- Conversions: ${formatNumber(accountTotals.target.conversions)} vs ${formatNumber(accountTotals.baselineDaily.conversions)} avg/day (${formatSignedPercent(accountPercentChange.conversions)})`,
-    `- Conversion rate: ${targetConversionRate == null ? "N/A" : `${(targetConversionRate * 100).toFixed(2)}%`} vs ${baselineConversionRate == null ? "N/A" : `${(baselineConversionRate * 100).toFixed(2)}%`} (${formatSignedPercent(conversionRateChange)})`,
-    "",
-    "Top campaign drivers behind the drop:",
-    ...topCampaignDrivers.flatMap((campaign) => {
-      const parts = [`- ${campaign.campaignName || "Unknown campaign"} (ID ${campaign.campaignId})`];
+    `- Conversion rate: ${targetConversionRate == null ? "N/A" : `${(targetConversionRate * 100).toFixed(2)}%`} vs ${baselineConversionRate == null ? "N/A" : `${(baselineConversionRate * 100).toFixed(2)}%`} (${formatSignedPercent(conversionRateChange)})`
+  ];
+
+  if (topPositiveCampaigns.length) {
+    lines.push("", "What went right or stayed resilient:");
+    topPositiveCampaigns.forEach((campaign) => {
       const metricParts = [];
       for (const metricName of ["conversions", "clicks", "impressions", "cost"]) {
         const metric = campaign.metrics[metricName];
         if (!metric) continue;
-        metricParts.push(
-          `${metricName} ${formatSignedPercent(metric.percentChange)}`
-        );
+        metricParts.push(`${metricName} ${formatSignedPercent(metric.percentChange)}`);
       }
-      if (metricParts.length) {
-        parts.push(`  ${metricParts.join("; ")}`);
-      }
-      return parts;
-    }),
-    "",
-    "Recent change signals in the last 30 days:",
-    `- ${changeSummary.counts.status} status-related change(s)`,
-    `- ${changeSummary.counts.budget} budget-related change(s)`,
-    `- ${changeSummary.counts.bidding} bid/bidding change(s)`,
-    `- ${changeSummary.counts.target_roas} target ROAS change(s)`,
-    `- ${changeSummary.counts.target_cpa} target CPA change(s)`,
-    `- ${changeSummary.counts.policy} policy-related change(s)`,
-    `- ${changeSummary.counts.verification} verification-related change(s)`
-  ];
-
-  if (relevantChangeEvents.length) {
-    lines.push("", "Most relevant recent change events:");
-    relevantChangeEvents.slice(0, 5).forEach((event) => {
-      lines.push(
-        `- ${event.changeDateTime || "unknown time"} | ${event.labelText} | ${event.resourceType || "campaign"} | ${event.resourceName || "unknown resource"}${event.userEmail ? ` | ${event.userEmail}` : ""}`
-      );
+      lines.push(`- ${campaign.campaignName || "Unknown campaign"} (ID ${campaign.campaignId})${metricParts.length ? `: ${metricParts.join("; ")}` : ""}`);
     });
   }
 
-  if (diagnosisWrong.length) {
-    lines.push("", "Campaign diagnostics also point to these weak areas:");
-    diagnosisWrong.slice(0, 3).forEach((item) => {
-      const campaignName = item?.campaign_name || "Unknown campaign";
-      const recs = Array.isArray(item?.recommendations) ? item.recommendations.slice(0, 2) : [];
-      lines.push(`- ${campaignName}`);
-      recs.forEach((rec) => lines.push(`  - ${rec}`));
+  lines.push("", "What went wrong:");
+  topCampaignDrivers.slice(0, 5).forEach((campaign) => {
+    const metricParts = [];
+    for (const metricName of ["conversions", "clicks", "impressions", "cost"]) {
+      const metric = campaign.metrics[metricName];
+      if (!metric) continue;
+      metricParts.push(`${metricName} ${formatSignedPercent(metric.percentChange)}`);
+    }
+    lines.push(`- ${campaign.campaignName || "Unknown campaign"} (ID ${campaign.campaignId})${metricParts.length ? `: ${metricParts.join("; ")}` : ""}`);
+  });
+
+  lines.push("", "Recent change signals:");
+  lines.push(`- ${changeSummary.counts.status} status-related change(s)`);
+  lines.push(`- ${changeSummary.counts.budget} budget-related change(s)`);
+  lines.push(`- ${changeSummary.counts.bidding} bid/bidding change(s)`);
+  lines.push(`- ${changeSummary.counts.target_roas} target ROAS change(s)`);
+  lines.push(`- ${changeSummary.counts.target_cpa} target CPA change(s)`);
+  lines.push(`- ${changeSummary.counts.policy} policy-related change(s)`);
+  lines.push(`- ${changeSummary.counts.verification} verification-related change(s)`);
+
+  if (impressionShareSnapshot?.available && impressionShareSnapshot.items.length) {
+    lines.push("", "Impression-share clues:");
+    impressionShareSnapshot.items.forEach((item) => {
+      const shareParts = [];
+      if (Number.isFinite(item.searchShare)) shareParts.push(`search share ${item.searchShare.toFixed(2)}%`);
+      if (Number.isFinite(item.budgetLostShare)) shareParts.push(`budget lost ${item.budgetLostShare.toFixed(2)}%`);
+      if (Number.isFinite(item.rankLostShare)) shareParts.push(`rank lost ${item.rankLostShare.toFixed(2)}%`);
+      if (Number.isFinite(item.absoluteTopShare)) shareParts.push(`absolute top ${item.absoluteTopShare.toFixed(2)}%`);
+      lines.push(`- ${item.campaignName || "Unknown campaign"} (ID ${item.campaignId})${shareParts.length ? `: ${shareParts.join("; ")}` : ""}`);
     });
+  } else {
+    lines.push("", "Impression-share clues: not available from the queried fields.");
   }
 
   lines.push(
     "",
-    "Most likely cause from the available data:",
-    targetConversionRate != null &&
-      baselineConversionRate != null &&
-      Math.abs(conversionRateChange || 0) <= 15 &&
-      accountPercentChange.clicks != null &&
-      accountPercentChange.clicks <= -20 &&
-      accountPercentChange.impressions != null &&
-      accountPercentChange.impressions <= -20
-      ? "- Broad traffic contraction is the main driver. Conversions fell because fewer users reached the account; conversion efficiency looks comparatively less damaged."
-      : "- The data suggests a mix of traffic contraction and campaign-level deterioration. If conversion rate also weakened, landing page, offer, tracking, or feed relevance may also be contributing.",
-    "- I cannot verify an account-level verification or policy block from the data we query here unless change history or a dedicated policy signal exposes it."
+    "Immediate actions:",
+    rootCauseLabel === "budget_constraint"
+      ? "- Raise or rebalance budget on the constrained campaigns first, then recheck impression share and conversions after one full day."
+      : rootCauseLabel === "auction_competitiveness"
+        ? "- Improve bid competitiveness on the affected campaigns, then recheck rank-lost impression share and clicks after one full day."
+        : rootCauseLabel === "recent_bid_or_budget_change"
+          ? "- Review the recent bid, budget, target ROAS, or target CPA change and roll back or soften it if it coincides with the dip."
+          : rootCauseLabel === "status_or_serving_shift"
+            ? "- Review the recent status or serving changes first, because those can suppress traffic immediately."
+            : "- Review the biggest traffic losers first, then check budgets, bids, eligibility, and search terms before increasing spend.",
+    "- If the Ads UI shows an active policy or verification alert, treat that as the first blocker to resolve, but do not assume one from this data alone.",
+    "- On campaigns spending without conversions, inspect search terms, landing pages, feed quality, and tracking before scaling."
   );
 
-  if (diagnosisRecommendations.length) {
-    lines.push("", "Next checks:");
-    diagnosisRecommendations.slice(0, 3).forEach((rec) => lines.push(`- ${rec}`));
-  }
+  lines.push("", "What not to assume:");
+  lines.push("- I cannot verify a live policy or verification block from the available signals alone.");
+  lines.push("- This is not just a weak-conversion problem; the dominant issue is upstream traffic loss.");
 
   return {
     text: lines.join("\n"),
@@ -1618,6 +1825,9 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
       account_percent_change: accountPercentChange,
       conversion_rate_change: conversionRateChange,
       top_campaign_drivers: topCampaignDrivers,
+      top_positive_campaigns: topPositiveCampaigns,
+      root_cause_label: rootCauseLabel,
+      impression_share_snapshot: impressionShareSnapshot,
       change_event_counts: changeSummary.counts,
       relevant_change_events: relevantChangeEvents,
       diagnosis
