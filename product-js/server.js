@@ -909,9 +909,6 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   const conditions = [
     `campaign.name = '${escapeGaqlString(campaignName)}'`,
-    "campaign.status = 'ENABLED'",
-    "ad_group.status = 'ENABLED'",
-    "metrics.conversions > 0",
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -951,38 +948,45 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     const id = String(row?.["ad_group.id"] || "").trim();
     const name = String(row?.["ad_group.name"] || "").trim();
     if (!id || !name) continue;
-    const date = String(row?.["segments.date"] || "").trim();
     const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
     const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
-    const cpaInr = conversions > 0 && costMicros > 0 ? costMicros / 1_000_000 / conversions : 0;
     const prev = byAdGroup.get(id) || {
       adGroupId: id,
       adGroupName: name,
-      maxCpaInr: 0,
-      firstSeenDate: date || ""
+      conversions: 0,
+      costMicros: 0
     };
-    if (cpaInr > prev.maxCpaInr) prev.maxCpaInr = cpaInr;
-    if (!prev.firstSeenDate && date) prev.firstSeenDate = date;
+    prev.conversions += conversions;
+    prev.costMicros += costMicros;
     byAdGroup.set(id, prev);
   }
 
   const qualifying = Array.from(byAdGroup.values())
-    .filter((item) => item.maxCpaInr > thresholdInr)
-    .sort((a, b) => b.maxCpaInr - a.maxCpaInr);
+    .map((item) => {
+      const cpaInr = item.conversions > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
+      if (!Number.isFinite(cpaInr) || cpaInr <= thresholdInr) return null;
+      return {
+        adGroupName: item.adGroupName,
+        conversions: item.conversions,
+        cpaInr
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.cpaInr - a.cpaInr);
 
   const count = qualifying.length;
   const sample = qualifying.slice(0, 25);
   const lines = [
-    `For customer ${cid}, campaign "${campaignName}", in ${usedExplicitRange ? "the requested range" : "the last 7 complete days"} (${dateStart} to ${dateEnd}), ${count} ad group(s) exceeded INR ${formatNumber(thresholdInr)} on at least one day.`,
+    `For customer ${cid}, campaign "${campaignName}", in ${usedExplicitRange ? "the requested range" : "the last 7 complete days"} (${dateStart} to ${dateEnd}), ${count} ad group(s) had cost per conversion above INR ${formatNumber(thresholdInr)}.`,
   ];
 
   if (!count) {
     lines.push("", "No qualifying ad groups were found in this range.");
   } else {
-    lines.push("", "| Ad Group | Max Daily Cost / Conversion (INR) |", "| --- | ---: |");
+    lines.push("", "| Ad Group | Conversions | Cost / Conversion (INR) |", "| --- | ---: | ---: |");
     sample.forEach((item) => {
       lines.push(
-        `| ${item.adGroupName} | ${formatNumber(item.maxCpaInr)} |`
+        `| ${item.adGroupName} | ${formatNumber(item.conversions)} | ${formatNumber(item.cpaInr)} |`
       );
     });
     if (count > sample.length) {
@@ -992,7 +996,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   lines.push(
     "",
-    "Formula used: cost_per_conversion per day = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions); counted unique ad groups that exceeded the threshold on at least one day in the requested range."
+    "Formula used: cost_per_conversion = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
   );
 
   return {
