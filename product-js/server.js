@@ -1218,20 +1218,6 @@ async function runChatJob(job) {
     return { ...out, interpretedQuery: job.interpretedQuery || "" };
   }
 
-  if (isHighVolumeBreakdownQuestion(job.message) && !hasSpecificCampaignScope(job.message)) {
-    if (isAllCampaignScopeRequest(job.message) || hasBroadCampaignScope(job.message)) {
-      await updateJob(job.id, { phase: "ads" });
-      const out = await runTopCampaignPreviewFastPath(job.customerId, context);
-      return { ...out, interpretedQuery: job.interpretedQuery || "" };
-    }
-    return {
-      text: buildNarrowScopePrompt(job),
-      customerIdUsed: resolvedCustomerId(job.customerId) || null,
-      mode: "fast-path",
-      interpretedQuery: job.interpretedQuery || ""
-    };
-  }
-
   if (isPausedLast24HoursQuestion(job.message)) {
     await updateJob(job.id, { phase: "ads" });
     const out = await runPausedCampaignFastPath(job.customerId, context);
