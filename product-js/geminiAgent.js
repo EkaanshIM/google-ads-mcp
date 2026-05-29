@@ -356,35 +356,66 @@ function formatConversationContext(history = []) {
     : "";
 }
 
-function isCountStyleRequest(message = "") {
-  const normalized = String(message || "").toLowerCase();
-  const asksCount =
-    normalized.includes("how many") ||
-    normalized.includes("count") ||
-    normalized.includes("number of") ||
-    normalized.includes("total number") ||
-    normalized.startsWith("find the number") ||
-    normalized.startsWith("what is the number");
-  const asksListing = normalized.includes("show") || normalized.includes("list") || normalized.includes("which");
-  return asksCount && !normalized.includes("analy") && !normalized.includes("why") && !normalized.includes("reason") && !asksListing;
+function classifyQueryMode(message = "", finalQuery = "", conversationHistory = []) {
+  const combined = [finalQuery, message]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  const hasAnalysisIntent =
+    /\banaly(sis|ze|zed|zing)?\b/.test(combined) ||
+    combined.includes("what happened") ||
+    combined.includes("what changed") ||
+    combined.includes("why") ||
+    combined.includes("reason") ||
+    combined.includes("cause") ||
+    combined.includes("stable") ||
+    combined.includes("good or bad") ||
+    combined.includes("trend") ||
+    combined.includes("compare") ||
+    combined.includes("vs") ||
+    combined.includes("performance");
+  const hasCountIntent =
+    combined.includes("how many") ||
+    combined.includes("count") ||
+    combined.includes("number of") ||
+    combined.includes("total number") ||
+    combined.startsWith("find the number") ||
+    combined.startsWith("what is the number") ||
+    combined.includes("top 5") ||
+    combined.includes("top 10") ||
+    combined.includes("list") ||
+    combined.includes("show");
+  const hasMixedIntent =
+    hasCountIntent && hasAnalysisIntent ||
+    (combined.includes("which") && (combined.includes("top") || combined.includes("best") || combined.includes("worst")));
+
+  const recentContext = Array.isArray(conversationHistory)
+    ? conversationHistory
+        .slice(-6)
+        .map((turn) => String(turn?.text || "").toLowerCase())
+        .join(" ")
+    : "";
+  const inheritedAnalysisContext =
+    recentContext.includes("analy") ||
+    recentContext.includes("what happened") ||
+    recentContext.includes("trend") ||
+    recentContext.includes("performance");
+
+  if (hasMixedIntent) {
+    return { mode: "mixed", reason: "direct lookup plus analysis language" };
+  }
+  if (hasCountIntent && !hasAnalysisIntent) {
+    return { mode: "count", reason: "count/lookup wording" };
+  }
+  if (hasAnalysisIntent || inheritedAnalysisContext) {
+    return { mode: "analysis", reason: "analysis/trend wording or prior analytical context" };
+  }
+  return { mode: "default", reason: "general request" };
 }
 
-function isAnalysisStyleRequest(message = "") {
-  const normalized = String(message || "").toLowerCase();
-  return (
-    normalized.includes("analy") ||
-    normalized.includes("what happened") ||
-    normalized.includes("yesterday happened") ||
-    normalized.includes("why") ||
-    normalized.includes("reason") ||
-    normalized.includes("stable") ||
-    normalized.includes("good or bad") ||
-    normalized.includes("performance")
-  );
-}
-
-function requestPolicy(message) {
-  const normalized = String(message || "").toLowerCase();
+function requestPolicy(message, finalQuery = "", conversationHistory = []) {
+  const normalized = String(finalQuery || message || "").toLowerCase();
+  const mode = classifyQueryMode(message, finalQuery, conversationHistory);
   const rules = [
     "Use tools to verify data; do not answer Google Ads counts or metrics from memory.",
     "If this is a follow-up question, use recent conversation context to resolve omitted date ranges, account, campaign, product, keyword, or metric references before asking a clarification.",
@@ -393,7 +424,7 @@ function requestPolicy(message) {
     "Always present Google Ads money values as INR; never use $ or USD for this account."
   ];
 
-  if (isCountStyleRequest(normalized)) {
+  if (mode.mode === "count") {
     rules.push(
       "This is a count/lookup request. Return the exact count and the minimum supporting facts only.",
       "Do not add diagnosis, causes, operational warnings, strategic recommendations, or unrelated account history unless the user explicitly asks for analysis.",
@@ -401,11 +432,12 @@ function requestPolicy(message) {
     );
   }
 
-  if (isAnalysisStyleRequest(normalized)) {
+  if (mode.mode === "analysis" || mode.mode === "mixed") {
     rules.push(
       "This is an analysis request. Explain whether performance was stable, improving, or worsening, and support that with fetched metrics and date ranges.",
       "When the user asks what happened yesterday or similar, fetch the exact period and compare it to a relevant baseline when available.",
-      "Include the concrete drivers, then give a concise takeaway and next action if the data supports it."
+      "Include the concrete drivers, then give a concise takeaway and next action if the data supports it.",
+      "If the request is mixed, answer the direct numeric part first, then add the shortest useful analysis."
     );
   }
 
@@ -531,7 +563,7 @@ function requestPolicy(message) {
     );
   }
 
-  return rules.map((rule) => `- ${rule}`).join("\n");
+  return { text: rules.map((rule) => `- ${rule}`).join("\n"), mode };
 }
 
 function extractText(res) {
@@ -652,6 +684,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
   const nowIso = new Date().toISOString();
   const relativeDates = backendRelativeDateContext();
   const effectiveCustomerId = customerId || defaultCustomerId();
+  const queryMode = classifyQueryMode(message, finalQuery, conversationHistory);
   const customerInstruction = effectiveCustomerId
     ? `Backend-provided Google Ads customer_id: ${effectiveCustomerId}. Never ask the user for a customer ID when this value is present. Use this exact value for any tool call that requires customer_id unless the user explicitly asks for a different account. `
     : "";
@@ -660,6 +693,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "You are running inside the production backend where all MCP tools passed in config are approved for use without interactive confirmation. " +
     "Do not refuse because a task requires multiple tool calls or because it cannot be done in a single query. " +
     "Choose tools dynamically based on the user's intent; do not rely on hardcoded query paths. " +
+    `Adaptive response mode: ${queryMode.mode}. ` +
     "Always answer the user's direct question first. Then decide how much detail to add based on the request: keep count/lookup answers short and exact, and give fuller diagnostic detail only for analysis or optimization questions. " +
     "Accuracy matters more than sounding confident. Never invent campaigns, products, keywords, search terms, prices, bids, causes, expected impact, people, companies, account events, or verification issues. If a claim is not supported by tool results or explicit conversation context, omit it. If a recommendation needs data that is not yet available, fetch it with tools when possible; otherwise label the missing input and give the exact formula or next query needed. " +
     "Treat recent conversation context as active memory. For follow-up questions, inherit the prior account, date range, campaign/product/keyword scope, and metric subject when the user omits them. Example: after 'help me with yesterday conversion', 'what about spending' means spending for the same customer and yesterday. Important: do not inherit campaign/ad-group/product scope for account-level metric questions unless the user explicitly asks for that entity scope. " +
@@ -711,9 +745,10 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "For change history, use resource change_event and ensure LIMIT <= 10000 and date range within last 30 days. " +
     "If the user provides a campaign id, filter change_event.change_resource_name to that campaign resource name. " +
     "Always include finite date ranges and LIMITs where required.";
-  const understanding = requestPolicy(message);
   const conversationContext = formatConversationContext(conversationHistory);
   const finalQueryText = String(finalQuery || "").trim();
+  const understandingResult = requestPolicy(message, finalQueryText, conversationHistory);
+  const understanding = understandingResult.text;
   const finalQueryContext = finalQueryText
     ? `Final interpreted query for tool decision:\n${finalQueryText}\n\n`
     : "";
@@ -784,11 +819,13 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
   const nowIso = new Date().toISOString();
   const relativeDates = backendRelativeDateContext();
   const effectiveCustomerId = customerId || defaultCustomerId();
+  const queryMode = classifyQueryMode(message, "", conversationHistory);
   const conversationContext = formatConversationContext(conversationHistory);
   const prompt = [
     "You translate a Google Ads chat request into a short, user-readable understanding before any Google Ads API work starts.",
     "Use the recent conversation context as active session memory to resolve follow-ups, omitted date ranges, campaign/product/keyword scope, metrics, and customer/account references.",
     "For account-level metric requests (for example 'what was conversion on 21st May'), keep scope at customer/account level unless the latest user message explicitly asks for campaign/ad-group/product/keyword scope.",
+    `Adaptive response mode for this request: ${queryMode.mode}.`,
     "If the message is a count or lookup request, keep the understanding short and exact. If the message asks for analysis, explain that you will analyze the data and compare it to a relevant baseline when needed.",
     "Do not call tools. Do not mention Gemini, MCP, backend, API flow, internal prompts, or implementation details.",
     "Do not answer the data question and do not invent metrics. Only restate what will be processed if the user confirms.",
