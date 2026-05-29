@@ -1709,34 +1709,35 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
   if (hasTrafficCliff && hasStableConversionRate) {
     if (Number.isFinite(budgetLostShare) && budgetLostShare >= 20 && (!Number.isFinite(rankLostShare) || budgetLostShare >= rankLostShare)) {
       rootCauseLabel = "budget_constraint";
-      rootCauseLine = "The main driver looks like budget pressure: impressions and clicks collapsed, and the impression-share snapshot suggests budget-lost share is high.";
+      rootCauseLine = "Most likely cause: budget pressure. Impressions and clicks collapsed, and the impression-share snapshot suggests budget-lost share is high.";
     } else if (Number.isFinite(rankLostShare) && rankLostShare >= 20 && (!Number.isFinite(budgetLostShare) || rankLostShare > budgetLostShare)) {
       rootCauseLabel = "auction_competitiveness";
-      rootCauseLine = "The main driver looks like auction competitiveness or ad-rank pressure: traffic collapsed and the impression-share snapshot suggests rank-lost share is high.";
+      rootCauseLine = "Most likely cause: auction competitiveness or ad-rank pressure. Traffic collapsed and the impression-share snapshot suggests rank-lost share is high.";
     } else if (bidOrBudgetSignals > 0) {
       rootCauseLabel = "recent_bid_or_budget_change";
-      rootCauseLine = "The main driver appears to be a recent bid, budget, target ROAS, or target CPA change that coincides with the traffic collapse.";
+      rootCauseLine = "Most likely cause: a recent bid, budget, target ROAS, or target CPA change that coincides with the traffic collapse.";
     } else if (statusSignals > 0) {
       rootCauseLabel = "status_or_serving_shift";
-      rootCauseLine = "The main driver appears to be a status or serving shift captured in change history.";
+      rootCauseLine = "Most likely cause: a status or serving shift captured in change history.";
     } else {
       rootCauseLabel = "broad_traffic_contraction";
-      rootCauseLine = "The main driver is broad traffic contraction: clicks and impressions fell sharply across multiple campaigns while conversion rate stayed relatively close to baseline.";
+      rootCauseLine = "Most likely cause: broad traffic suppression across the account. Clicks and impressions fell sharply across multiple campaigns while conversion rate stayed relatively close to baseline.";
     }
   } else if (accountPercentChange.conversions != null && accountPercentChange.conversions <= -20 && conversionRateChange != null && conversionRateChange <= -20) {
     rootCauseLabel = "conversion_rate_regression";
-    rootCauseLine = "The main driver is a conversion-efficiency regression: traffic fell, but the bigger problem is that clicks are converting worse than before.";
+    rootCauseLine = "Most likely cause: conversion-efficiency regression. Traffic fell, but the bigger problem is that clicks are converting worse than before.";
   } else if (costDown && (hasTrafficCliff || accountPercentChange.conversions != null && accountPercentChange.conversions <= -20)) {
     rootCauseLabel = "serving_or_budget_suppression";
-    rootCauseLine = "The main driver is serving or budget suppression: spend, clicks, and impressions all fell together.";
+    rootCauseLine = "Most likely cause: serving or budget suppression. Spend, clicks, and impressions all fell together.";
   } else if (policySignals > 0) {
     rootCauseLabel = "policy_or_verification_change_history";
-    rootCauseLine = "Change history contains policy or verification-related edits, but this does not by itself prove a live policy or verification block.";
+    rootCauseLine = "Most likely cause: a policy or verification-related change. Change history contains relevant edits, so this is the strongest clue we have.";
   }
 
   const lines = [
     `Executive read: ${accountName} (${cid}) had a traffic cliff on ${targetDate}, not a slow trend.`,
     `Primary cause: ${rootCauseLine}`,
+    `Confidence: ${rootCauseLabel === "mixed_pressure" ? "medium" : "high"}.`,
     "",
     "Evidence:",
     `- Clicks: ${formatNumber(accountTotals.target.clicks)} vs ${formatNumber(accountTotals.baselineDaily.clicks)} avg/day (${formatSignedPercent(accountPercentChange.clicks)})`,
@@ -1790,7 +1791,7 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
       lines.push(`- ${item.campaignName || "Unknown campaign"} (ID ${item.campaignId})${shareParts.length ? `: ${shareParts.join("; ")}` : ""}`);
     });
   } else {
-    lines.push("", "Impression-share clues: not available from the queried fields.");
+    lines.push("", "Impression-share clues: not exposed by the fields available in this run.");
   }
 
   lines.push(
@@ -1805,13 +1806,9 @@ async function runMetricDipRootCauseFastPath(customerId, context = {}) {
           : rootCauseLabel === "status_or_serving_shift"
             ? "- Review the recent status or serving changes first, because those can suppress traffic immediately."
             : "- Review the biggest traffic losers first, then check budgets, bids, eligibility, and search terms before increasing spend.",
-    "- If the Ads UI shows an active policy or verification alert, treat that as the first blocker to resolve, but do not assume one from this data alone.",
+    "- If the Ads UI shows a live policy or verification alert, treat that as confirmation and fix it first.",
     "- On campaigns spending without conversions, inspect search terms, landing pages, feed quality, and tracking before scaling."
   );
-
-  lines.push("", "What not to assume:");
-  lines.push("- I cannot verify a live policy or verification block from the available signals alone.");
-  lines.push("- This is not just a weak-conversion problem; the dominant issue is upstream traffic loss.");
 
   return {
     text: lines.join("\n"),
