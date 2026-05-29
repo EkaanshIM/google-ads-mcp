@@ -902,16 +902,15 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     "ad_group.id",
     "ad_group.name",
     "ad_group.status",
-    "ad_group.primary_status",
-    "metrics.clicks",
-    "metrics.impressions",
     "metrics.cost_micros",
-    "metrics.conversions",
-    "metrics.cost_per_conversion"
+    "metrics.conversions"
   ];
 
   const conditions = [
     `campaign.name = '${escapeGaqlString(campaignName)}'`,
+    "campaign.status = 'ENABLED'",
+    "ad_group.status = 'ENABLED'",
+    "metrics.conversions > 0",
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -946,40 +945,16 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   });
 
   const data = Array.isArray(rows) ? rows : [];
-  const byAdGroup = new Map();
-  for (const row of data) {
-    const id = String(row?.["ad_group.id"] || "").trim();
-    const name = String(row?.["ad_group.name"] || "").trim();
-    if (!id || !name) continue;
-    const prev = byAdGroup.get(id) || {
-      adGroupId: id,
-      adGroupName: name,
-      conversions: 0,
-      costMicros: 0,
-      cpaDirectSum: 0,
-      cpaDirectCount: 0
-    };
-    const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
-    const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
-    const cpaDirectInr = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
-    prev.conversions += conversions;
-    prev.costMicros += costMicros;
-    if (cpaDirectInr > 0) {
-      prev.cpaDirectSum += cpaDirectInr;
-      prev.cpaDirectCount += 1;
-    }
-    byAdGroup.set(id, prev);
-  }
-
-  const qualifying = Array.from(byAdGroup.values())
-    .map((item) => {
-      const cpaFromMicros = item.conversions > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
-      const cpaFromMetric = item.cpaDirectCount > 0 ? item.cpaDirectSum / item.cpaDirectCount : 0;
-      const cpaInr = cpaFromMetric > 0 ? cpaFromMetric : cpaFromMicros;
-      if (!Number.isFinite(cpaInr) || cpaInr <= 0) return null;
+  const qualifying = data
+    .map((row) => {
+      const adGroupName = String(row?.["ad_group.name"] || "").trim();
+      const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
+      const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
+      if (!adGroupName || conversions <= 0 || costMicros <= 0) return null;
+      const cpaInr = costMicros / 1_000_000 / conversions;
       return {
-        adGroupName: item.adGroupName,
-        conversions: item.conversions,
+        adGroupName,
+        conversions,
         cpaInr
       };
     })
@@ -1008,7 +983,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   lines.push(
     "",
-    "Formula used: preferred direct metric metrics.cost_per_conversion in INR when available; fallback = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
+    "Formula used: cost_per_conversion = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
   );
 
   return {
