@@ -631,9 +631,29 @@ function parseMcpToolResult(toolOut) {
   return toolOut;
 }
 
-async function resolveCampaignNameForAccount(customerId, requestedCampaignName, context = {}) {
+function scoreCampaignNameMatch(requestedCampaignName, candidateName) {
+  const requestedNormalized = normalizeCampaignNameForMatch(requestedCampaignName);
+  const candidateNormalized = normalizeCampaignNameForMatch(candidateName);
+  const requestedTokens = requestedNormalized.split(" ").filter(Boolean);
+  const tokensMatched = requestedTokens.filter((token) => candidateNormalized.includes(token)).length;
+  const exact = candidateNormalized === requestedNormalized;
+  const contains =
+    candidateNormalized.includes(requestedNormalized) || requestedNormalized.includes(candidateNormalized);
+  const requiredTokenMatches = Math.max(1, Math.ceil(requestedTokens.length * 0.75));
+  const acceptable = exact || contains || tokensMatched >= requiredTokenMatches;
+
+  return {
+    exact,
+    contains,
+    tokensMatched,
+    acceptable,
+    nameLength: String(candidateName || "").length
+  };
+}
+
+async function resolveCampaignForAccount(customerId, requestedCampaignName, context = {}) {
   const requested = String(requestedCampaignName || "").trim();
-  if (!requested) return "";
+  if (!requested) return null;
 
   const cid = resolvedCustomerId(customerId);
   const mcp = await getMcpClient();
@@ -643,12 +663,12 @@ async function resolveCampaignNameForAccount(customerId, requestedCampaignName, 
       customer_id: cid,
       resource: "campaign",
       fields: ["campaign.id", "campaign.name", "campaign.status"],
-      conditions: ["campaign.status = 'ENABLED'"],
-      limit: 5000
+      conditions: [],
+      limit: 10000
     }
   };
 
-  await logDebugEvent("server.campaign_name_resolution_call", {
+  await logDebugEvent("server.campaign_resolution_call", {
     ...context,
     toolName: toolRequest.name,
     toolArguments: toolRequest.arguments,
@@ -657,28 +677,52 @@ async function resolveCampaignNameForAccount(customerId, requestedCampaignName, 
   const toolOut = await mcp.callTool(toolRequest);
   const rows = parseMcpToolResult(toolOut);
   const campaigns = Array.isArray(rows) ? rows : [];
-  const requestedNormalized = normalizeCampaignNameForMatch(requested);
-  const requestedTokens = requestedNormalized.split(" ").filter(Boolean);
 
   const scored = campaigns
     .map((row) => {
+      const id = String(row?.["campaign.id"] || "").trim();
       const name = String(row?.["campaign.name"] || "").trim();
-      const normalized = normalizeCampaignNameForMatch(name);
-      const tokensMatched = requestedTokens.filter((token) => normalized.includes(token)).length;
-      const exact = normalized === requestedNormalized;
-      const contains = normalized.includes(requestedNormalized) || requestedNormalized.includes(normalized);
-      return { name, normalized, exact, contains, tokensMatched };
+      const status = String(row?.["campaign.status"] || "").trim();
+      const match = scoreCampaignNameMatch(requested, name);
+      return { id, name, status, ...match };
     })
-    .filter((item) => item.name && item.tokensMatched > 0)
+    .filter((item) => item.id && item.name && item.acceptable)
     .sort((a, b) => {
       if (a.exact !== b.exact) return a.exact ? -1 : 1;
       if (a.contains !== b.contains) return a.contains ? -1 : 1;
       if (a.tokensMatched !== b.tokensMatched) return b.tokensMatched - a.tokensMatched;
-      return a.name.length - b.name.length;
+      return a.nameLength - b.nameLength;
     });
 
-  const best = scored[0];
-  return best?.name || requested;
+  const best = scored[0] || null;
+  await logDebugEvent("server.campaign_resolution_result", {
+    ...context,
+    requestedCampaignName: requested,
+    campaignCount: campaigns.length,
+    selectedCampaignId: best?.id || null,
+    selectedCampaignName: best?.name || null,
+    selectedCampaignStatus: best?.status || null,
+    selectedMatch: best
+      ? {
+          exact: best.exact,
+          contains: best.contains,
+          tokensMatched: best.tokensMatched
+        }
+      : null
+  });
+
+  return best
+    ? {
+        id: best.id,
+        name: best.name,
+        status: best.status
+      }
+    : null;
+}
+
+async function resolveCampaignNameForAccount(customerId, requestedCampaignName, context = {}) {
+  const campaign = await resolveCampaignForAccount(customerId, requestedCampaignName, context);
+  return campaign?.name || String(requestedCampaignName || "").trim();
 }
 
 async function runProductMultipleCampaignFastPath(customerId, context = {}) {
@@ -890,13 +934,15 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   const cid = resolvedCustomerId(customerId);
   const thresholdInr = Number(params?.thresholdInr || 500);
   const requestedCampaignName = String(params?.campaignName || "").trim();
-  const campaignName = await resolveCampaignNameForAccount(cid, requestedCampaignName, context);
+  const resolvedCampaign = await resolveCampaignForAccount(cid, requestedCampaignName, context);
+  const campaignName = resolvedCampaign?.name || requestedCampaignName;
   const dateEnd = String(params?.dateEnd || "").trim() || accountDateFromOffset(-1);
   const dateStart = String(params?.dateStart || "").trim() || accountDateFromOffset(-7);
   const usedExplicitRange = Boolean(params?.dateStart && params?.dateEnd);
   const mcp = await getMcpClient();
 
   const fields = [
+    "campaign.id",
     "campaign.name",
     "campaign.status",
     "ad_group.id",
@@ -908,7 +954,9 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   ];
 
   const conditions = [
-    `campaign.name = '${escapeGaqlString(campaignName)}'`,
+    resolvedCampaign?.id
+      ? `campaign.id = ${resolvedCampaign.id}`
+      : `campaign.name = '${escapeGaqlString(campaignName)}'`,
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -1004,10 +1052,16 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     customerIdUsed: cid,
     mode: "fast-path",
     result: {
+      requested_campaign_name: requestedCampaignName,
+      resolved_campaign_id: resolvedCampaign?.id || null,
+      resolved_campaign_name: resolvedCampaign?.name || null,
+      resolved_campaign_status: resolvedCampaign?.status || null,
       campaign_name: campaignName,
       threshold_inr: thresholdInr,
       date_start: dateStart,
       date_end: dateEnd,
+      rows_fetched: data.length,
+      ad_groups_scanned: byAdGroup.size,
       count,
       rows: qualifying
     }
