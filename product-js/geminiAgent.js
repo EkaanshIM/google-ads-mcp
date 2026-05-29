@@ -276,7 +276,7 @@ function enforceAccountLevelUnderstandingText(text = "", message = "", customerI
   out = out.replace(/\s+in\s+the\s+["“][^"”\n]{2,160}["”]\s+campaign/gi, "");
   out = out.replace(/\s+in\s+the\s+[^,.\n]{2,160}\s+campaign/gi, "");
   if (!/account level|customer level/i.test(out)) {
-    out += `\nI will run this at account level${customerId ? ` for customer ${customerId}` : ""}.`;
+    out += `\nAccount-level scope${customerId ? ` for customer ${customerId}` : ""}.`;
   }
   return out;
 }
@@ -577,6 +577,15 @@ function extractText(res) {
   return texts.join("\n");
 }
 
+function cleanPlainText(text = "") {
+  return String(text || "")
+    .replace(/\*\*/g, "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function includeTraceInResponse() {
   const value = String(process.env.DEBUG_TRACE_IN_RESPONSE || "false").toLowerCase();
   return value === "1" || value === "true" || value === "yes";
@@ -700,12 +709,13 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     "When tool results include relevant supporting metrics, include them for analysis questions. Prefer concise tables or bullets for ranked results, comparisons, winners/losers, anomalies, and performance summaries. For count questions, do not expand into broad commentary unless asked. " +
     "For every data answer, include the account/customer when known, the exact date range used, the primary metric used to rank or decide, and any important caveat such as missing data, zero baseline, partial current-day data, or a metric that cannot be inferred. " +
     "When there are meaningful patterns in analysis questions, mention the top positive driver, top negative driver, and one practical takeaway; keep this grounded in the fetched tool data and do not invent causes. " +
+    "For decline or root-cause questions, prioritize traffic, conversion rate, budget, bid, status, and recent change-history signals before concluding. Do not claim a policy or verification block unless a tool result or change event supports it. " +
     "For optimization and diagnostic answers, be specific before being strategic. Name the actual campaigns, ad groups, products, search terms, keywords, assets, or segments that are driving the metric change when tools can fetch them. " +
     "Do not stop at generic advice. For every major recommendation, include: evidence from the data, the exact change to make, how to make it in Google Ads or the feed, expected directional impact, risk/guardrail, and what to check next. " +
     "When the data needed for a detailed diagnosis is not yet fetched, run additional focused drill-down queries before answering instead of saying to 'review' something. Useful drill-downs include product trend drops, dead-click products with spend/clicks and zero conversions, search terms with spend and no conversions, keywords with rising CPC or falling CTR, and products/terms that gained conversions efficiently. " +
     "For keyword advice, do not say 'add new keywords' generically. Provide actual keyword/search term text from fetched search term or keyword data, identify match type suggestions when reasonable, and separate scale candidates from negative keyword candidates. " +
     "For bid or pricing advice, do not say 'adjust bids' generically. Provide a numeric bid/CPC/CPA/ROAS range when data supports it, explain the calculation, and include a guardrail such as max CPC, target CPA, or minimum conversion volume. If the account uses Smart Bidding and manual CPC is not applicable, recommend target CPA/ROAS or budget changes instead of fake keyword-level CPCs. " +
-    "Use clear readable formatting with short sections, tables where helpful, and action bullets that start with a verb. " +
+    "Use clear readable formatting with short sections, tables where helpful, and action bullets that start with a verb. Do not use markdown emphasis like ** or __; keep the final answer plain text so the UI stays neat. " +
     "For count questions such as total count, how many, inventory size, product count, product/feed count, or item count, use count_rows instead of search whenever a row-level listing is not needed. Never fetch all matching product/feed rows just to count them. For product/feed counts, usually use the shopping_product resource and a selectable identifier field such as shopping_product.resource_name; add explicit segments.date conditions when the user asks for a date-specific count. " +
     "Prefer deterministic analytics tools when available: count_entities for entity counts, rank_campaigns for campaign best/worst/top/bottom performance, diagnose_campaign_period for campaign diagnostic reporting and recommendations, campaign_growth_decision_brief for boost plans, exact search-term/keyword actions, bid/budget decisions, and expected impact estimates, compare_campaigns_to_7day_average for campaign 7-day average comparisons, product_status_breakdown, count_products_by_status, and count_products_in_multiple_campaigns for Merchant Center product eligibility/campaign-overlap counts, and account_metric_summary for account-level metric totals. Use raw search only when a deterministic tool does not fit. " +
     "All Google Ads currency values in this app must be presented as INR. Never use $, USD, or any non-INR currency symbol for cost, spend, CPC, CPA, or budget values. If a tool returns numeric cost values, label them as INR. " +
@@ -787,7 +797,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
     config
   });
 
-  let text = extractText(res1);
+  let text = cleanPlainText(extractText(res1));
   let res2 = null;
   if (!text || !text.trim()) {
     // Sometimes the model completes tool calls but forgets to output a final message.
@@ -798,7 +808,7 @@ export async function runGeminiWithMcp({ message, finalQuery = "", customerId, j
         "\n\nIMPORTANT: Provide a final plain-English answer summarizing the tool results. Do not return empty output.",
       config
     });
-    text = extractText(res2);
+    text = cleanPlainText(extractText(res2));
   }
 
   const debugTrace = {
@@ -834,7 +844,7 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
     "When the user says 'yesterday' or 'today', resolve it from the backend account-local date anchors below and mention the resolved date.",
     "If the user asks high-volume cross-campaign breakdowns (ad groups/keywords/search terms across all campaigns), ask for one campaign first. Do not suggest top 5 campaigns when the user already named a specific campaign.",
     "If the request is truly ambiguous even after using context, state the missing detail in one short sentence.",
-    "Return only the confirmation text, in 2-4 short lines.",
+    "Return only the confirmation text, ideally as one short sentence and no more than 2 short lines.",
     "",
     `Current timestamp (UTC): ${nowIso}. Backend default account time zone: ${relativeDates.timeZone}.`,
     `Resolved account-local dates: today=${relativeDates.today}, yesterday=${relativeDates.yesterday}, 7-day baseline before yesterday=${relativeDates.sevenDayBaselineStart}..${relativeDates.sevenDayBaselineEnd}.`,
@@ -860,7 +870,7 @@ export async function runGeminiUnderstanding({ message, customerId, conversation
       temperature: 0
     }
   });
-  const rawText = extractText(res).trim();
+  const rawText = cleanPlainText(extractText(res));
   const accountScopedText = enforceAccountLevelUnderstandingText(rawText, message, effectiveCustomerId);
   const text = enforceConcreteUnderstandingText(
     accountScopedText,

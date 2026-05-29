@@ -938,6 +938,129 @@ function parseConversionsVs7dQuery(message) {
   return (mentions7d && mentionsCompare) || (mentions7d && mentionsYesterday);
 }
 
+function isMetricDipRootCauseQuestion(message) {
+  const normalized = String(message || "").toLowerCase();
+  const hasRootCauseIntent =
+    normalized.includes("why") ||
+    normalized.includes("reason") ||
+    normalized.includes("cause") ||
+    normalized.includes("what led") ||
+    normalized.includes("what caused");
+  const hasDipLanguage =
+    normalized.includes("dip") ||
+    normalized.includes("decline") ||
+    normalized.includes("drop") ||
+    normalized.includes("down") ||
+    normalized.includes("decrease") ||
+    normalized.includes("fell") ||
+    normalized.includes("fall");
+  const hasMetricLanguage =
+    normalized.includes("metric") ||
+    normalized.includes("metrics") ||
+    normalized.includes("conversion") ||
+    normalized.includes("click") ||
+    normalized.includes("impression") ||
+    normalized.includes("spend") ||
+    normalized.includes("traffic") ||
+    normalized.includes("performance");
+  return hasRootCauseIntent && hasDipLanguage && hasMetricLanguage;
+}
+
+function formatSignedPercent(value) {
+  if (!Number.isFinite(value)) return "N/A";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function changeEventFieldText(fields) {
+  if (Array.isArray(fields)) return fields.join(" ").toLowerCase();
+  return String(fields || "").toLowerCase();
+}
+
+function summarizeChangeEventSignals(rows = []) {
+  const events = [];
+  const counts = {
+    status: 0,
+    budget: 0,
+    bidding: 0,
+    target_roas: 0,
+    target_cpa: 0,
+    keywords: 0,
+    ad_group: 0,
+    asset: 0,
+    product: 0,
+    policy: 0,
+    verification: 0,
+    other: 0
+  };
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const changedFields = row?.["change_event.changed_fields"] ?? row?.change_event?.changed_fields ?? row?.changed_fields ?? "";
+    const fieldText = changeEventFieldText(changedFields);
+    const changeDateTime = String(row?.["change_event.change_date_time"] ?? row?.change_event?.change_date_time ?? "").trim();
+    const userEmail = String(row?.["change_event.user_email"] ?? row?.change_event?.user_email ?? "").trim();
+    const resourceName = String(row?.["change_event.change_resource_name"] ?? row?.change_event?.change_resource_name ?? "").trim();
+    const resourceType = String(row?.["change_event.change_resource_type"] ?? row?.change_event?.change_resource_type ?? "").trim();
+
+    const labels = [];
+    if (fieldText.includes("status")) {
+      counts.status += 1;
+      labels.push("status");
+    }
+    if (fieldText.includes("budget")) {
+      counts.budget += 1;
+      labels.push("budget");
+    }
+    if (fieldText.includes("bid") || fieldText.includes("bidding")) {
+      counts.bidding += 1;
+      labels.push("bid/bidding");
+    }
+    if (fieldText.includes("target_roas") || fieldText.includes("roas")) {
+      counts.target_roas += 1;
+      labels.push("target ROAS");
+    }
+    if (fieldText.includes("target_cpa") || fieldText.includes("cpa")) {
+      counts.target_cpa += 1;
+      labels.push("target CPA");
+    }
+    if (fieldText.includes("keyword") || fieldText.includes("search_term")) {
+      counts.keywords += 1;
+      labels.push("keyword/search term");
+    }
+    if (fieldText.includes("ad_group")) {
+      counts.ad_group += 1;
+      labels.push("ad group");
+    }
+    if (fieldText.includes("asset")) {
+      counts.asset += 1;
+      labels.push("asset");
+    }
+    if (fieldText.includes("product") || fieldText.includes("shopping_product")) {
+      counts.product += 1;
+      labels.push("product");
+    }
+    if (fieldText.includes("policy")) {
+      counts.policy += 1;
+      labels.push("policy");
+    }
+    if (fieldText.includes("verification")) {
+      counts.verification += 1;
+      labels.push("verification");
+    }
+    if (!labels.length) counts.other += 1;
+
+    const labelText = labels.length ? labels.join(", ") : "other";
+    events.push({
+      changeDateTime,
+      userEmail,
+      resourceName,
+      resourceType,
+      labelText
+    });
+  }
+
+  return { counts, events };
+}
+
 async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) {
   const cid = resolvedCustomerId(customerId);
   const thresholdInr = Number(params?.thresholdInr || 500);
@@ -1206,6 +1329,302 @@ async function runConversionsVs7dFastPath(customerId, context = {}) {
   };
 }
 
+async function runMetricDipRootCauseFastPath(customerId, context = {}) {
+  const cid = resolvedCustomerId(customerId);
+  const targetDate = accountDateFromOffset(-1);
+  const baselineStart = accountDateFromOffset(-8);
+  const baselineEnd = accountDateFromOffset(-2);
+  const analysisStart = accountDateFromOffset(-30);
+  const analysisEnd = targetDate;
+  const metricFields = ["metrics.clicks", "metrics.impressions", "metrics.cost_micros", "metrics.conversions"];
+  const mcp = await getMcpClient();
+
+  const callParsedTool = async (name, arguments_) => {
+    const toolRequest = { name, arguments: arguments_ };
+    await logDebugEvent("server.fast_path_mcp_call", {
+      ...context,
+      toolName: toolRequest.name,
+      toolArguments: toolRequest.arguments
+    });
+    const toolOut = await mcp.callTool(toolRequest);
+    const parsed = parseMcpToolResult(toolOut);
+    await logDebugEvent("server.fast_path_mcp_result", {
+      ...context,
+      toolName: toolRequest.name,
+      toolArguments: toolRequest.arguments,
+      result: summarizeMcpResult(parsed)
+    });
+    return parsed;
+  };
+
+  const [targetSummaryRaw, baselineSummaryRaw, conversionsCompareRaw, clicksCompareRaw, impressionsCompareRaw, costCompareRaw, diagnosisRaw, changeEventsRaw] =
+    await Promise.all([
+      callParsedTool("account_metric_summary", {
+        customer_id: cid,
+        date_start: targetDate,
+        date_end: targetDate,
+        metrics: metricFields
+      }),
+      callParsedTool("account_metric_summary", {
+        customer_id: cid,
+        date_start: baselineStart,
+        date_end: baselineEnd,
+        metrics: metricFields
+      }),
+      callParsedTool("compare_campaigns_to_7day_average", {
+        customer_id: cid,
+        metric: "conversions",
+        target_date: targetDate,
+        top_n: 8,
+        status: "ENABLED"
+      }),
+      callParsedTool("compare_campaigns_to_7day_average", {
+        customer_id: cid,
+        metric: "clicks",
+        target_date: targetDate,
+        top_n: 8,
+        status: "ENABLED"
+      }),
+      callParsedTool("compare_campaigns_to_7day_average", {
+        customer_id: cid,
+        metric: "impressions",
+        target_date: targetDate,
+        top_n: 8,
+        status: "ENABLED"
+      }),
+      callParsedTool("compare_campaigns_to_7day_average", {
+        customer_id: cid,
+        metric: "cost",
+        target_date: targetDate,
+        top_n: 8,
+        status: "ENABLED"
+      }),
+      callParsedTool("diagnose_campaign_period", {
+        customer_id: cid,
+        date_start: analysisStart,
+        date_end: analysisEnd,
+        status: "ENABLED",
+        top_n: 5
+      }),
+      callParsedTool("search", {
+        customer_id: cid,
+        resource: "change_event",
+        fields: [
+          "change_event.change_date_time",
+          "change_event.user_email",
+          "change_event.change_resource_name",
+          "change_event.change_resource_type",
+          "change_event.resource_change_operation",
+          "change_event.changed_fields"
+        ],
+        conditions: [
+          "change_event.change_date_time DURING LAST_30_DAYS",
+          "change_event.change_resource_type = 'CAMPAIGN'"
+        ],
+        orderings: ["change_event.change_date_time DESC"],
+        limit: 2000
+      })
+    ]);
+
+  const targetSummary = targetSummaryRaw?.metrics || {};
+  const baselineSummary = baselineSummaryRaw?.metrics || {};
+
+  const accountTotals = {
+    target: {
+      clicks: toFiniteNumberLoose(targetSummary["metrics.clicks"]),
+      impressions: toFiniteNumberLoose(targetSummary["metrics.impressions"]),
+      cost: toFiniteNumberLoose(targetSummary.cost),
+      conversions: toFiniteNumberLoose(targetSummary["metrics.conversions"])
+    },
+    baselineDaily: {
+      clicks: toFiniteNumberLoose(baselineSummary["metrics.clicks"]) / 7,
+      impressions: toFiniteNumberLoose(baselineSummary["metrics.impressions"]) / 7,
+      cost: toFiniteNumberLoose(baselineSummary.cost) / 7,
+      conversions: toFiniteNumberLoose(baselineSummary["metrics.conversions"]) / 7
+    }
+  };
+
+  const accountDelta = {
+    clicks: accountTotals.target.clicks - accountTotals.baselineDaily.clicks,
+    impressions: accountTotals.target.impressions - accountTotals.baselineDaily.impressions,
+    cost: accountTotals.target.cost - accountTotals.baselineDaily.cost,
+    conversions: accountTotals.target.conversions - accountTotals.baselineDaily.conversions
+  };
+
+  const accountPercentChange = {
+    clicks: accountTotals.baselineDaily.clicks
+      ? (accountDelta.clicks / accountTotals.baselineDaily.clicks) * 100
+      : null,
+    impressions: accountTotals.baselineDaily.impressions
+      ? (accountDelta.impressions / accountTotals.baselineDaily.impressions) * 100
+      : null,
+    cost: accountTotals.baselineDaily.cost ? (accountDelta.cost / accountTotals.baselineDaily.cost) * 100 : null,
+    conversions: accountTotals.baselineDaily.conversions
+      ? (accountDelta.conversions / accountTotals.baselineDaily.conversions) * 100
+      : null
+  };
+
+  const targetConversionRate =
+    accountTotals.target.clicks > 0 ? accountTotals.target.conversions / accountTotals.target.clicks : null;
+  const baselineConversionRate =
+    accountTotals.baselineDaily.clicks > 0
+      ? accountTotals.baselineDaily.conversions / accountTotals.baselineDaily.clicks
+      : null;
+  const conversionRateChange =
+    baselineConversionRate && baselineConversionRate > 0
+      ? ((targetConversionRate - baselineConversionRate) / baselineConversionRate) * 100
+      : null;
+
+  const compareRawByMetric = {
+    conversions: conversionsCompareRaw,
+    clicks: clicksCompareRaw,
+    impressions: impressionsCompareRaw,
+    cost: costCompareRaw
+  };
+  const campaignMap = new Map();
+  for (const [metricName, compareRaw] of Object.entries(compareRawByMetric)) {
+    const rows = Array.isArray(compareRaw?.largest_decreases) ? compareRaw.largest_decreases : [];
+    for (const row of rows) {
+      const campaignId = String(row?.campaign_id || "").trim();
+      if (!campaignId) continue;
+      const campaignName = String(row?.campaign_name || "").trim();
+      const absoluteChange = toFiniteNumberLoose(row?.absolute_change);
+      if (absoluteChange >= 0) continue;
+      const percentChange = Number.isFinite(Number(row?.percent_change)) ? Number(row.percent_change) : null;
+      const entry = campaignMap.get(campaignId) || {
+        campaignId,
+        campaignName,
+        campaignStatus: String(row?.campaign_status || "").trim(),
+        metrics: {},
+        score: 0
+      };
+      if (campaignName && !entry.campaignName) entry.campaignName = campaignName;
+      if (row?.campaign_status && !entry.campaignStatus) entry.campaignStatus = String(row.campaign_status).trim();
+      entry.metrics[metricName] = {
+        targetValue: toFiniteNumberLoose(row?.target_value),
+        baselineAverage: toFiniteNumberLoose(row?.baseline_average),
+        absoluteChange,
+        percentChange
+      };
+      if (absoluteChange < 0) {
+        entry.score += Math.abs(percentChange ?? absoluteChange);
+      }
+      campaignMap.set(campaignId, entry);
+    }
+  }
+
+  const topCampaignDrivers = Array.from(campaignMap.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  const changeEvents = Array.isArray(changeEventsRaw) ? changeEventsRaw : [];
+  const changeSummary = summarizeChangeEventSignals(changeEvents);
+  const relevantChangeEvents = changeSummary.events.filter((event) =>
+    /status|budget|bid|bidding|target roas|target cpa/i.test(event.labelText)
+  );
+
+  const diagnosis = diagnosisRaw || {};
+  const diagnosisWrong = Array.isArray(diagnosis.what_went_wrong) ? diagnosis.what_went_wrong : [];
+  const diagnosisRecommendations = Array.isArray(diagnosis.recommended_modification_types)
+    ? diagnosis.recommended_modification_types
+    : [];
+  const accountName = targetSummaryRaw?.account_name || baselineSummaryRaw?.account_name || "IndiaMART";
+
+  const lines = [
+    `For account ${accountName} (${cid}), yesterday (${targetDate}) looks like a traffic cliff, not a single-metric blip.`,
+    "",
+    "Account-level comparison vs the previous 7 complete days:",
+    `- Clicks: ${formatNumber(accountTotals.target.clicks)} vs ${formatNumber(accountTotals.baselineDaily.clicks)} avg/day (${formatSignedPercent(accountPercentChange.clicks)})`,
+    `- Impressions: ${formatNumber(accountTotals.target.impressions)} vs ${formatNumber(accountTotals.baselineDaily.impressions)} avg/day (${formatSignedPercent(accountPercentChange.impressions)})`,
+    `- Cost: INR ${formatNumber(accountTotals.target.cost)} vs INR ${formatNumber(accountTotals.baselineDaily.cost)} avg/day (${formatSignedPercent(accountPercentChange.cost)})`,
+    `- Conversions: ${formatNumber(accountTotals.target.conversions)} vs ${formatNumber(accountTotals.baselineDaily.conversions)} avg/day (${formatSignedPercent(accountPercentChange.conversions)})`,
+    `- Conversion rate: ${targetConversionRate == null ? "N/A" : `${(targetConversionRate * 100).toFixed(2)}%`} vs ${baselineConversionRate == null ? "N/A" : `${(baselineConversionRate * 100).toFixed(2)}%`} (${formatSignedPercent(conversionRateChange)})`,
+    "",
+    "Top campaign drivers behind the drop:",
+    ...topCampaignDrivers.flatMap((campaign) => {
+      const parts = [`- ${campaign.campaignName || "Unknown campaign"} (ID ${campaign.campaignId})`];
+      const metricParts = [];
+      for (const metricName of ["conversions", "clicks", "impressions", "cost"]) {
+        const metric = campaign.metrics[metricName];
+        if (!metric) continue;
+        metricParts.push(
+          `${metricName} ${formatSignedPercent(metric.percentChange)}`
+        );
+      }
+      if (metricParts.length) {
+        parts.push(`  ${metricParts.join("; ")}`);
+      }
+      return parts;
+    }),
+    "",
+    "Recent change signals in the last 30 days:",
+    `- ${changeSummary.counts.status} status-related change(s)`,
+    `- ${changeSummary.counts.budget} budget-related change(s)`,
+    `- ${changeSummary.counts.bidding} bid/bidding change(s)`,
+    `- ${changeSummary.counts.target_roas} target ROAS change(s)`,
+    `- ${changeSummary.counts.target_cpa} target CPA change(s)`,
+    `- ${changeSummary.counts.policy} policy-related change(s)`,
+    `- ${changeSummary.counts.verification} verification-related change(s)`
+  ];
+
+  if (relevantChangeEvents.length) {
+    lines.push("", "Most relevant recent change events:");
+    relevantChangeEvents.slice(0, 5).forEach((event) => {
+      lines.push(
+        `- ${event.changeDateTime || "unknown time"} | ${event.labelText} | ${event.resourceType || "campaign"} | ${event.resourceName || "unknown resource"}${event.userEmail ? ` | ${event.userEmail}` : ""}`
+      );
+    });
+  }
+
+  if (diagnosisWrong.length) {
+    lines.push("", "Campaign diagnostics also point to these weak areas:");
+    diagnosisWrong.slice(0, 3).forEach((item) => {
+      const campaignName = item?.campaign_name || "Unknown campaign";
+      const recs = Array.isArray(item?.recommendations) ? item.recommendations.slice(0, 2) : [];
+      lines.push(`- ${campaignName}`);
+      recs.forEach((rec) => lines.push(`  - ${rec}`));
+    });
+  }
+
+  lines.push(
+    "",
+    "Most likely cause from the available data:",
+    targetConversionRate != null &&
+      baselineConversionRate != null &&
+      Math.abs(conversionRateChange || 0) <= 15 &&
+      accountPercentChange.clicks != null &&
+      accountPercentChange.clicks <= -20 &&
+      accountPercentChange.impressions != null &&
+      accountPercentChange.impressions <= -20
+      ? "- Broad traffic contraction is the main driver. Conversions fell because fewer users reached the account; conversion efficiency looks comparatively less damaged."
+      : "- The data suggests a mix of traffic contraction and campaign-level deterioration. If conversion rate also weakened, landing page, offer, tracking, or feed relevance may also be contributing.",
+    "- I cannot verify an account-level verification or policy block from the data we query here unless change history or a dedicated policy signal exposes it."
+  );
+
+  if (diagnosisRecommendations.length) {
+    lines.push("", "Next checks:");
+    diagnosisRecommendations.slice(0, 3).forEach((rec) => lines.push(`- ${rec}`));
+  }
+
+  return {
+    text: lines.join("\n"),
+    customerIdUsed: cid,
+    mode: "root-cause-fast-path",
+    result: {
+      target_date: targetDate,
+      baseline_start: baselineStart,
+      baseline_end: baselineEnd,
+      account_totals: accountTotals,
+      account_percent_change: accountPercentChange,
+      conversion_rate_change: conversionRateChange,
+      top_campaign_drivers: topCampaignDrivers,
+      change_event_counts: changeSummary.counts,
+      relevant_change_events: relevantChangeEvents,
+      diagnosis
+    }
+  };
+}
+
 async function runPausedCampaignFastPath(customerId, context = {}) {
   const cid = resolvedCustomerId(customerId);
   if (!cid) {
@@ -1298,6 +1717,12 @@ async function runChatJob(job) {
     sessionId: job.sessionId,
     userMessage: job.message
   };
+
+  if (isMetricDipRootCauseQuestion(job.message)) {
+    await updateJob(job.id, { phase: "ads" });
+    const out = await runMetricDipRootCauseFastPath(job.customerId, context);
+    return { ...out, interpretedQuery: job.interpretedQuery || "" };
+  }
 
   if (parseConversionsVs7dQuery(job.message)) {
     await updateJob(job.id, { phase: "ads" });
