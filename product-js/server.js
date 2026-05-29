@@ -294,14 +294,23 @@ function parseExplicitDateRange(message, timeZone = backendTimeZone()) {
   const text = String(message || "");
   const currentYear = accountCurrentYear(timeZone);
 
-  const isoRangeMatch = text.match(
+  const normalizeOrdinals = (value) =>
+    String(value || "")
+      .replace(/(\d)(st|nd|rd|th)\b/gi, "$1")
+      .replace(/[,]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const normalizedText = normalizeOrdinals(text);
+
+  const isoRangeMatch = normalizedText.match(
     /\b(20\d{2}-\d{2}-\d{2})\s*(?:to|through|thru|-)\s*(20\d{2}-\d{2}-\d{2})\b/i
   );
   if (isoRangeMatch) {
     return { dateStart: isoRangeMatch[1], dateEnd: isoRangeMatch[2], source: "explicit_range" };
   }
 
-  const namedRangeMatch = text.match(
+  const namedRangeMatch = normalizedText.match(
     /\b(\d{1,2})\s*([a-zA-Z]{3,9})(?:\s*(20\d{2}))?\s*(?:to|through|thru|-)\s*(\d{1,2})\s*([a-zA-Z]{3,9})(?:\s*(20\d{2}))?\b/i
   );
   if (namedRangeMatch) {
@@ -311,6 +320,21 @@ function parseExplicitDateRange(message, timeZone = backendTimeZone()) {
     const endYear = Number(namedRangeMatch[6] || namedRangeMatch[3] || startYear);
     const dateStart = toIsoDate(startYear, startMonth, Number(namedRangeMatch[1]));
     const dateEnd = toIsoDate(endYear, endMonth, Number(namedRangeMatch[4]));
+    if (dateStart && dateEnd) {
+      return { dateStart, dateEnd, source: "explicit_range" };
+    }
+  }
+
+  const monthFirstRangeMatch = normalizedText.match(
+    /\b([a-zA-Z]{3,9})\s*(\d{1,2})(?:\s*(20\d{2}))?\s*(?:to|through|thru|-)\s*([a-zA-Z]{3,9})\s*(\d{1,2})(?:\s*(20\d{2}))?\b/i
+  );
+  if (monthFirstRangeMatch) {
+    const startMonth = parseMonthNameToken(monthFirstRangeMatch[1]);
+    const endMonth = parseMonthNameToken(monthFirstRangeMatch[4]);
+    const startYear = Number(monthFirstRangeMatch[3] || monthFirstRangeMatch[6] || currentYear);
+    const endYear = Number(monthFirstRangeMatch[6] || monthFirstRangeMatch[3] || startYear);
+    const dateStart = toIsoDate(startYear, startMonth, Number(monthFirstRangeMatch[2]));
+    const dateEnd = toIsoDate(endYear, endMonth, Number(monthFirstRangeMatch[5]));
     if (dateStart && dateEnd) {
       return { dateStart, dateEnd, source: "explicit_range" };
     }
@@ -534,11 +558,18 @@ function parseAdGroupCpaThresholdQuestion(message) {
   const thresholdInr = thresholdMatch ? Number(thresholdMatch[1]) : 500;
   if (!Number.isFinite(thresholdInr) || thresholdInr < 0) return null;
 
-  const quotedCampaign = text.match(/campaign\s*["“]([^"”\n]{2,160})["”]/i)?.[1]?.trim();
+  const quotedCampaignAfterWord = text.match(/campaign\s*["']([^"'\n]{2,160})["']/i)?.[1]?.trim();
+  const quotedCampaignBeforeWord = text.match(/(?:in|for)\s+(?:the\s+)?["']([^"'\n]{2,160})["']\s+campaign\b/i)?.[1]?.trim();
   const unquotedCampaign = text.match(/in\s+the\s+campaign\s+([^,\n.]{2,160})/i)?.[1]?.trim();
   const bareCampaignWithAds = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?\s+ads)\b/i)?.[1]?.trim();
   const bareCampaignBeforeHave = text.match(/in\s+([a-z0-9][a-z0-9&/().,\- ]{2,160}?)\s+have\b/i)?.[1]?.trim();
-  const campaignName = quotedCampaign || unquotedCampaign || bareCampaignWithAds || bareCampaignBeforeHave || "";
+  const campaignName =
+    quotedCampaignBeforeWord ||
+    quotedCampaignAfterWord ||
+    unquotedCampaign ||
+    bareCampaignWithAds ||
+    bareCampaignBeforeHave ||
+    "";
   if (!campaignName) return null;
 
   const explicitRange = parseExplicitDateRange(text);
