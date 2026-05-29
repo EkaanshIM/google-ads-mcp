@@ -654,7 +654,7 @@ def rank_campaigns(
         ),
         "candidate_count": len(ranked),
         "best": ranked[:final_top_n],
-        "worst": list(reversed(ranked[-final_top_n:])) if ranked else [],
+        "worst": ranked[-final_top_n:] if ranked else [],
     }
 
 
