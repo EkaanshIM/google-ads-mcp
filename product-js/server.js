@@ -912,10 +912,6 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   const conditions = [
     `campaign.name = '${escapeGaqlString(campaignName)}'`,
-    "campaign.status = 'ENABLED'",
-    "ad_group.status = 'ENABLED'",
-    "metrics.conversions > 0.1",
-    "metrics.clicks > 0",
     `segments.date >= '${dateStart}'`,
     `segments.date <= '${dateEnd}'`
   ];
@@ -965,11 +961,11 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
     };
     const conversions = toFiniteNumberLoose(row?.["metrics.conversions"]);
     const costMicros = toFiniteNumberLoose(row?.["metrics.cost_micros"]);
-    const cpaDirectMicros = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
+    const cpaDirectInr = toFiniteNumberLoose(row?.["metrics.cost_per_conversion"]);
     prev.conversions += conversions;
     prev.costMicros += costMicros;
-    if (cpaDirectMicros > 0) {
-      prev.cpaDirectSum += cpaDirectMicros / 1_000_000;
+    if (cpaDirectInr > 0) {
+      prev.cpaDirectSum += cpaDirectInr;
       prev.cpaDirectCount += 1;
     }
     byAdGroup.set(id, prev);
@@ -977,10 +973,9 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   const qualifying = Array.from(byAdGroup.values())
     .map((item) => {
-      if (item.conversions <= 0.2) return null;
-      const cpaFromMicros = item.costMicros > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
+      const cpaFromMicros = item.conversions > 0 ? item.costMicros / 1_000_000 / item.conversions : 0;
       const cpaFromMetric = item.cpaDirectCount > 0 ? item.cpaDirectSum / item.cpaDirectCount : 0;
-      const cpaInr = cpaFromMicros > 0 ? cpaFromMicros : cpaFromMetric;
+      const cpaInr = cpaFromMetric > 0 ? cpaFromMetric : cpaFromMicros;
       if (!Number.isFinite(cpaInr) || cpaInr <= 0) return null;
       return {
         adGroupName: item.adGroupName,
@@ -998,7 +993,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
   ];
 
   if (!count) {
-    lines.push("", "No qualifying ad groups were found with conversions > 0.2 in this range.");
+    lines.push("", "No qualifying ad groups were found in this range.");
   } else {
     lines.push("", "| Ad Group | Conversions | Cost / Conversion (INR) |", "| --- | ---: | ---: |");
     sample.forEach((item) => {
@@ -1013,7 +1008,7 @@ async function runAdGroupCpaThresholdFastPath(customerId, params, context = {}) 
 
   lines.push(
     "",
-    "Formula used: aggregated cost_per_conversion = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
+    "Formula used: preferred direct metric metrics.cost_per_conversion in INR when available; fallback = sum(metrics.cost_micros) / 1,000,000 / sum(metrics.conversions)."
   );
 
   return {
